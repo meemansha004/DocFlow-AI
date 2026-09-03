@@ -1,0 +1,20 @@
+# Environment — NEVER commit secrets
+venv/
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Generated output — not source code
+drafts/
+draft generation/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
