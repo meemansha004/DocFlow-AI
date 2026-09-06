@@ -1,12 +1,22 @@
-""
+"""
+DocFlow AI — CLI chat interface, command-routed (Phase 5 + ABAC).
+
+Routing is 100% deterministic: the user's slash command decides which
+agent handles a message. draft_context tracks verified facts across
+BOTH /draft and /scan. Session context (who's using this CLI, acting as
+which team/project) is established once at startup — never LLM-controlled.
+"""
 
 import ast
 import json
 import uuid
 
+from app.database import SessionLocal
+from app.services.session_startup import select_current_user
+from app.services.session_context import set_current_session, get_current_session
+
 from app.agents.drafting_agent import drafting_agent
 from app.agents.scanner_agent import scanner_agent
-
 
 COMMANDS = ("/draft", "/scan", "/rag", "/query")
 
@@ -98,7 +108,18 @@ def _build_context_prefix(ctx) -> str:
 def main():
     print("=" * 60)
     print("DocFlow AI — Chat Interface")
-    print("Commands: /draft  /scan  /rag  /query   ('exit' to quit)")
+    print("=" * 60)
+
+    db = SessionLocal()
+    user, team, project, role = select_current_user(db)
+    set_current_session(
+        user_id=user.user_id,
+        team_id=team.team_id,
+        project_id=project.project_id,
+        role=role,
+    )
+    print(f"\nSession active: {user.email} — acting as {role.value if hasattr(role, 'value') else role} on {team.name} ({project.name})")
+    print("\nCommands: /draft  /scan  /rag  /query   ('exit' to quit)")
     print("=" * 60)
 
     session_id = str(uuid.uuid4())

@@ -1,33 +1,28 @@
-"""from app.agents.team import docflow_team
+from app.database import SessionLocal
+from app.models.user import User
+from app.models.team import Team
+from app.models.project import Project
+from app.services.access_control import has_permission
 
-response = docflow_team.run(
-    "Draft me a short Test Plan. It should cover functional testing of "
-    "login and checkout for the mobile app, owned by QA, running for one "
-    "week after build delivery."
-)
+db = SessionLocal()
 
-print("=== TEAM-LEVEL TOOLS/MEMBER CALLS ===")
-print(response.tools if hasattr(response, "tools") else "No .tools attribute")
+alice = db.query(User).filter(User.email == "alice@test.com").one()
+bob = db.query(User).filter(User.email == "bob@test.com").one()
+frank = db.query(User).filter(User.email == "frank@test.com").one()
+dave = db.query(User).filter(User.email == "dave@test.com").one()
 
-print("\n=== MEMBER RESPONSES ===")
-if hasattr(response, "member_responses"):
-    for i, member_resp in enumerate(response.member_responses):
-        print(f"--- Member {i} ---")
-        print("Agent/tools used:", getattr(member_resp, "tools", "N/A"))
-        print("Content preview:", str(member_resp.content)[:200])
-else:
-    print("No .member_responses attribute")
+engineering = db.query(Team).filter(Team.name == "Engineering", Team.project_id == db.query(Project).filter(Project.name == "Project A").one().project_id).one()
+qa_team = db.query(Team).filter(Team.name == "QA").one()
+project_a = db.query(Project).filter(Project.name == "Project A").one()
 
-print("\n=== FINAL CONTENT ===")
-print(response.content)"""
+# alice (org_admin) should bypass everything, even on a team she has no membership in
+print("alice upload on Engineering:", has_permission(db, alice.user_id, "upload", engineering.team_id, project_a.project_id))  # expect True
 
-from app.tools.draft_tools import extract_doc_type_and_stage
+# bob (project_admin of Project A) should bypass, even on QA where he has no membership
+print("bob upload on QA:", has_permission(db, bob.user_id, "upload", qa_team.team_id, project_a.project_id))  # expect True
 
-# Should succeed
-print(extract_doc_type_and_stage.entrypoint("I want to draft a Test Plan for the Testing stage"))
+# frank (contributor, but on Project B, no membership in Project A's QA team) should be denied
+print("frank upload on QA (Project A):", has_permission(db, frank.user_id, "upload", qa_team.team_id, project_a.project_id))  # expect False
 
-# Should raise ValueError
-try:
-    print(extract_doc_type_and_stage.entrypoint("I need a design doc"))
-except ValueError as e:
-    print("Correctly raised:", e)
+# dave (team_lead on QA) attempting a team_lead-only action on his own team
+print("dave approve_access_request on QA:", has_permission(db, dave.user_id, "approve_access_request", qa_team.team_id, project_a.project_id))  # expect True

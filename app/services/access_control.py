@@ -1,0 +1,197 @@
+"""
+Core ABAC/RBAC permission functions.
+
+has_permission() — the RBAC-style rank comparison, cumulative hierarchy,
+with org_admin/project_admin full bypass and the contributor confidential-
+access-grant exception.
+
+can_view_document() — combines has_permission with document-specific
+sensitivity + team-visibility checks (the ABAC layer wrapping the RBAC core).
+
+build_access_filter() — compound filter for listing/searching documents.
+"""
+
+from datetime import datetime, timezone
+from uuid import UUID
+
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from app.models.user import User
+from app.models.team import UserTeamMembership, ProjectAdmin, TeamRole, AccessRequest, AccessRequestStatus
+from app.models.document import Document, DocumentTeamVisibility, SensitivityLevel
+
+
+# Rank order — higher index = more privileged. Used for cumulative comparison.
+_TEAM_ROLE_RANK = {
+    TeamRole.viewer: 0,
+    TeamRole.contributor: 1,
+    TeamRole.team_lead: 2,
+}
+
+# Minimum TeamRole required per action (actions gated at team level).
+_ACTION_MIN_ROLE = {
+    "view": TeamRole.viewer,
+    "upload": TeamRole.contributor,
+    "edit": TeamRole.contributor,
+    "manage_team_members": TeamRole.team_lead,
+    "approve_access_request": TeamRole.team_lead,
+}
+
+_SENSITIVITY_RANK = {
+    SensitivityLevel.public: 0,
+    SensitivityLevel.internal: 1,
+    SensitivityLevel.confidential: 2,
+}
+
+
+def _is_org_admin(db: Session, user_id: UUID) -> bool:
+    user = db.get(User, user_id)
+    return bool(user and user.is_org_admin)
+
+
+def _is_project_admin(db: Session, user_id: UUID, project_id: UUID) -> bool:
+    stmt = select(ProjectAdmin).where(
+        ProjectAdmin.user_id == user_id, ProjectAdmin.project_id == project_id
+    )
+    return db.execute(stmt).scalar_one_or_none() is not None
+
+
+def _get_team_membership(db: Session, user_id: UUID, team_id: UUID) -> UserTeamMembership | None:
+    stmt = select(UserTeamMembership).where(
+        UserTeamMembership.user_id == user_id, UserTeamMembership.team_id == team_id
+    )
+    return db.execute(stmt).scalar_one_or_none()
+
+
+def has_permission(db: Session, user_id: UUID, action: str, team_id: UUID, project_id: UUID) -> bool:
+    """
+    Core rank-comparison check, cumulative hierarchy, with full bypass
+    for org_admin (tenant-wide) and project_admin (project-wide).
+    """
+    if _is_org_admin(db, user_id):
+        return True
+    if _is_project_admin(db, user_id, project_id):
+        return True
+
+    membership = _get_team_membership(db, user_id, team_id)
+    if membership is None:
+        return False  # no membership on this team = no access, full stop
+
+    required_role = _ACTION_MIN_ROLE.get(action)
+    if required_role is None:
+        raise ValueError(f"Unknown action: {action}")
+
+    return _TEAM_ROLE_RANK[membership.role] >= _TEAM_ROLE_RANK[required_role]
+
+
+def _has_active_confidential_grant(db: Session, user_id: UUID, team_id: UUID) -> bool:
+    stmt = select(AccessRequest).where(
+        AccessRequest.user_id == user_id,
+        AccessRequest.team_id == team_id,
+        AccessRequest.status == AccessRequestStatus.approved,
+    )
+    grant = db.execute(stmt).scalar_one_or_none()
+    if grant is None:
+        return False
+    if grant.expires_at and grant.expires_at < datetime.now(timezone.utc):
+        return False  # expired — treated as no grant
+    return True
+
+
+def can_view_document(db: Session, user_id: UUID, document: Document) -> bool:
+    """
+    Full ABAC check for viewing a specific document: bypass, team
+    visibility, and sensitivity clearance combined.
+    """
+    if _is_org_admin(db, user_id):
+        return True
+    if _is_project_admin(db, user_id, document.project_id):
+        return True
+
+    # Team visibility — document must be visible to a team the user belongs to
+    visible_team_ids = {
+        row.team_id for row in db.execute(
+            select(DocumentTeamVisibility).where(DocumentTeamVisibility.document_id == document.document_id)
+        ).scalars()
+    }
+    membership = None
+    for team_id in visible_team_ids:
+        m = _get_team_membership(db, user_id, team_id)
+        if m is not None:
+            membership = m
+            break
+
+    if membership is None:
+        return False  # not on any team this document is visible to
+
+    # Sensitivity clearance
+    if document.sensitivity_level in (SensitivityLevel.public, SensitivityLevel.internal):
+        return True  # viewer+ can always see these
+
+    # confidential tier
+    if _TEAM_ROLE_RANK[membership.role] >= _TEAM_ROLE_RANK[TeamRole.team_lead]:
+        return True  # team_lead+ sees confidential automatically
+
+    if membership.role == TeamRole.contributor:
+        return _has_active_confidential_grant(db, user_id, membership.team_id)
+
+    return False  # viewer, no grant path
+
+
+def build_access_filter(db: Session, user_id: UUID, project_id: UUID):
+    """
+    Returns a SQLAlchemy filter condition for querying documents within
+    a project, respecting tenant/project/team/sensitivity rules. For
+    org_admin/project_admin, returns a filter scoped only to tenant/project
+    (full visibility within that scope, no team/sensitivity restriction).
+    """
+    from sqlalchemy import and_, or_
+
+    user = db.get(User, user_id)
+
+    if user.is_org_admin:
+        return Document.tenant_id == user.tenant_id
+
+    if _is_project_admin(db, user_id, project_id):
+        return and_(Document.tenant_id == user.tenant_id, Document.project_id == project_id)
+
+    # Regular user: must be on a team the document is visible to
+    user_team_ids = [
+        row.team_id for row in db.execute(
+            select(UserTeamMembership).where(
+                UserTeamMembership.user_id == user_id,
+                UserTeamMembership.project_id == project_id,
+            )
+        ).scalars()
+    ]
+    if not user_team_ids:
+        return Document.document_id == None  # no access — matches nothing
+
+    visible_doc_ids_subquery = (
+        select(DocumentTeamVisibility.document_id)
+        .where(DocumentTeamVisibility.team_id.in_(user_team_ids))
+    )
+
+    return and_(
+        Document.tenant_id == user.tenant_id,
+        Document.project_id == project_id,
+        Document.document_id.in_(visible_doc_ids_subquery),
+        or_(
+            Document.sensitivity_level.in_([SensitivityLevel.public, SensitivityLevel.internal]),
+            # confidential handled by can_view_document() at the row level after fetch —
+            # this filter is a coarse pre-filter, not the final authority for confidential docs
+        ),
+    )
+
+def resolve_sensitivity(requested: str, role: str) -> SensitivityLevel:
+    """
+    Caps requested sensitivity by role. contributor capped at internal;
+    team_lead+/org_admin/project_admin can set confidential directly.
+    """
+    requested_level = SensitivityLevel(requested.lower())
+    if role in ("team_lead", "org_admin", "project_admin"):
+        return requested_level
+    if _SENSITIVITY_RANK[requested_level] > _SENSITIVITY_RANK[SensitivityLevel.internal]:
+        return SensitivityLevel.internal
+    return requested_level

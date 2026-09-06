@@ -8,9 +8,9 @@ from agno.tools import tool
 from app.services.draft_generator import draft_document as _draft_document
 from app.services.intent_extraction import extract_doc_type_and_stage as _extract
 from app.services.document_persistence import save_draft as _save_draft
+from app.services.document_persistence import create_document, PermissionDeniedError, StageNotFoundError
 
-
-@tool(show_result=True, stop_after_tool_call=True)
+@tool
 def draft_document(document_type: str, user_input: str) -> str:
     """
     Drafts a new document from a document type and the user's free-form
@@ -26,7 +26,7 @@ def draft_document(document_type: str, user_input: str) -> str:
     return _draft_document(document_type, user_input)
 
 
-@tool(show_result=True)
+@tool
 def extract_doc_type_and_stage(user_message: str) -> dict:
     """
     Extracts document type and stage from a user's message about drafting
@@ -49,7 +49,7 @@ def extract_doc_type_and_stage(user_message: str) -> dict:
     return result
 
 
-@tool(show_result=True)
+@tool
 def confirm_draft() -> str:
     """
     Call this ONLY when the user has explicitly confirmed they are
@@ -60,18 +60,25 @@ def confirm_draft() -> str:
     return "draft_confirmed_ready_for_scan"
 
 
+
+
 @tool(show_result=True, stop_after_tool_call=True)
 def confirm_upload(document_type: str, stage: str, content: str) -> str:
     """
     Call this ONLY when the user has explicitly confirmed they want to
     upload/save the FINAL, Scanner-approved document. This tool performs
-    the actual save. Only call it after scanning came back clean AND the
-    user has clearly confirmed they want to upload.
+    the actual save to the database, subject to the current user's
+    permissions.
 
     Args:
         document_type: the type of document (e.g. "Test Plan")
-        stage: the project stage this document belongs to
+        stage: the project stage this document belongs to (must match an
+               existing stage name)
         content: the final, approved document content in Markdown
     """
-    path = _save_draft(document_type, stage, content)
-    return f"Document saved to {path}"
+    try:
+        return create_document(document_type, stage, content)
+    except PermissionDeniedError as e:
+        return f"UPLOAD BLOCKED: {e}"
+    except StageNotFoundError as e:
+        return f"UPLOAD FAILED: {e}"

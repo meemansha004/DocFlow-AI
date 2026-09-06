@@ -4,6 +4,8 @@ import uuid
 from sqlalchemy import String, ForeignKey, UniqueConstraint, Enum
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
+from datetime import datetime, timezone
+from sqlalchemy import DateTime
 
 from app.database import Base
 
@@ -79,4 +81,47 @@ class ProjectAdmin(Base):
     )
     project_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("projects.project_id"), nullable=False
+    )
+
+
+class AccessRequestStatus(str, enum.Enum):
+    pending = "pending"
+    approved = "approved"
+    denied = "denied"
+
+
+class AccessRequest(Base):
+    """
+    Contributor's request for elevated (confidential-tier) access on a
+    specific team, approved/denied by that team's team_lead. Approval
+    sets expires_at (90 days out) — expired grants are treated as if
+    no grant exists; the user must request again.
+    """
+    __tablename__ = "access_requests"
+
+    request_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.user_id"), nullable=False
+    )
+    team_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("teams.team_id"), nullable=False
+    )
+    status: Mapped[AccessRequestStatus] = mapped_column(
+        Enum(AccessRequestStatus, name="access_request_status"),
+        default=AccessRequestStatus.pending,
+        nullable=False,
+    )
+    requested_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+    decided_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.user_id"), nullable=True
+    )
+    decided_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
     )
