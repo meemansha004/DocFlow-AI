@@ -1,19 +1,27 @@
 """
-DocFlow AI — CLI chat interface, command-routed (Phase 5 + ABAC).
+DocFlow AI — CLI chat interface, command-routed.
 
-Routing is 100% deterministic: the user's slash command decides which
-agent handles a message. draft_context tracks verified facts across
-BOTH /draft and /scan. Session context (who's using this CLI, acting as
-which team/project) is established once at startup — never LLM-controlled.
+Routing is 100% deterministic: the user's slash command decides which agent
+handles a message. Session context (who's using this CLI, acting as which
+team/project) is established once at startup — never LLM-controlled.
+
+The /draft flow (Phase 4 pivot) is fully decoupled from persistence: it drafts,
+revises, then finalizes to a LOCAL FILE under drafts/. It never touches the
+documents table, the users table, or has_permission(). Real persistence is the
+separate authenticated POST /documents/upload endpoint.
+
+The current draft lives in a session-scoped working file on disk
+(drafts/.wip/<session_id>.md) — that file is the single source of truth for
+"the current draft", read directly when building each turn's context and when
+finalizing. See app/services/draft_workspace.py.
 """
 
-import ast
-import json
 import uuid
 
 from app.database import SessionLocal
 from app.services.session_startup import select_current_user
-from app.services.session_context import set_current_session, get_current_session
+from app.services.session_context import set_current_session
+from app.services import draft_workspace
 
 from app.agents.drafting_agent import drafting_agent
 from app.agents.scanner_agent import scanner_agent
@@ -32,77 +40,49 @@ def _was_tool_called(response, tool_name: str) -> bool:
     return _get_tool_result(response, tool_name) is not None
 
 
-def _parse_result(raw):
-    if isinstance(raw, dict):
-        return raw
-    if isinstance(raw, str):
-        try:
-            return json.loads(raw)
-        except json.JSONDecodeError:
-            try:
-                return ast.literal_eval(raw)
-            except (ValueError, SyntaxError):
-                return None
-    return None
+def _finalize_from_disk() -> None:
+    """
+    Runs after the Drafting Agent calls confirm_draft. Deterministic: reads the
+    working file, scores it, moves it into drafts/, deletes the working file.
+    The draft content comes straight from disk — the LLM never carries it.
+    """
+    if not draft_workspace.has_working_draft():
+        print("\n(Nothing to finalize — no draft exists yet.)")
+        return
+
+    outcome = draft_workspace.finalize()
+    scan = outcome["scan"]
+    if scan is None:
+        print(f"\nStructure Scanner could not complete: {outcome['scan_error']}")
+    else:
+        print(f"\nStructure Scanner: {scan['overall_score']}/60")
+        for criterion in scan["criteria"]:
+            print(f"  - {criterion['name']}: {criterion['score']}/20 — {criterion['note']}")
+        print(f"  Summary: {scan['summary']}")
+
+    print(f"\nFinished draft saved to: {outcome['path']}")
+    print(
+        "(Local file only — not uploaded to any project, stage, or team. "
+        "Use the app's Upload feature for that.)"
+    )
 
 
-def _update_draft_context(response, ctx):
-    extract_result = _parse_result(_get_tool_result(response, "extract_doc_type_and_stage"))
-    if extract_result:
-        ctx["doc_type"] = extract_result.get("doc_type") or ctx["doc_type"]
-        ctx["stage"] = extract_result.get("stage") or ctx["stage"]
+def _build_context_prefix() -> str:
+    # Source of truth: the working file on disk, not any in-memory copy.
+    current = draft_workspace.read_working_draft()
+    if not current:
+        return "[No draft exists in this conversation yet.]\n\n"
 
-    draft_result = _get_tool_result(response, "draft_document")
-    if draft_result:
-        ctx["last_draft_content"] = draft_result
-        ctx["has_draft"] = True
-
-    if _was_tool_called(response, "confirm_draft"):
-        ctx["draft_confirmed"] = True
-
-    if _was_tool_called(response, "confirm_upload"):
-        ctx.update({
-            "doc_type": None,
-            "stage": None,
-            "draft_confirmed": False,
-            "has_draft": False,
-            "last_draft_content": None,
-            "last_scan_clean": False,
-            "last_scan_summary": None,
-        })
-
-
-def _update_scan_context(response, ctx):
-    score_result = _parse_result(_get_tool_result(response, "score_document"))
-    if score_result and "overall_score" in score_result:
-        ctx["last_scan_clean"] = score_result["overall_score"] >= 36
-        ctx["last_scan_summary"] = score_result.get("summary")
-
-
-def _build_context_prefix(ctx) -> str:
-    parts = []
-    if ctx["doc_type"]:
-        parts.append(f"document_type={ctx['doc_type']}")
-    if ctx["stage"]:
-        parts.append(f"stage={ctx['stage']}")
-    parts.append(f"draft_exists={ctx['has_draft']}")
-    parts.append(f"draft_confirmed={ctx['draft_confirmed']}")
-    if ctx["draft_confirmed"]:
-        parts.append(f"scan_clean={ctx['last_scan_clean']}")
-
-    prefix = f"[Known so far: {', '.join(parts)}]\n"
-
-    if ctx["has_draft"] and not ctx["draft_confirmed"]:
-        prefix += (
-            f"\n[Current draft content — if the user requests any edit, you "
-            f"MUST pass this FULL content back into draft_document's "
-            f"user_input, with only the requested change applied. Never "
-            f"call draft_document with just a description of the change — "
-            f"always include the complete current text:\n\n"
-            f"{ctx['last_draft_content']}\n]\n"
-        )
-
-    return prefix + "\n"
+    return (
+        "[A draft currently exists — the exact working copy below is what is on "
+        "disk right now.\n"
+        "- If the user requests ANY edit, pass this FULL text back into "
+        "draft_document's user_input with only the requested change applied — "
+        "never call draft_document with just a description of the change.\n"
+        "- If the user explicitly confirms they're satisfied, call "
+        "confirm_draft(confirmed=true) — never pass it any draft content.\n\n"
+        f"{current}\n]\n\n"
+    )
 
 
 def main():
@@ -118,22 +98,18 @@ def main():
         project_id=project.project_id,
         role=role,
     )
-    print(f"\nSession active: {user.email} — acting as {role.value if hasattr(role, 'value') else role} on {team.name} ({project.name})")
+    db.close()
+    print(
+        f"\nSession active: {user.email} — acting as "
+        f"{role.value if hasattr(role, 'value') else role} on "
+        f"{team.name} ({project.name})"
+    )
     print("\nCommands: /draft  /scan  /rag  /query   ('exit' to quit)")
     print("=" * 60)
 
     session_id = str(uuid.uuid4())
+    draft_workspace.set_session(session_id)
     active_agent = None
-
-    draft_context = {
-        "doc_type": None,
-        "stage": None,
-        "draft_confirmed": False,
-        "has_draft": False,
-        "last_draft_content": None,
-        "last_scan_clean": False,
-        "last_scan_summary": None,
-    }
 
     while True:
         raw = input("\nYou: ").strip()
@@ -159,36 +135,31 @@ def main():
 
         try:
             if active_agent == "/draft":
-                prefix = _build_context_prefix(draft_context)
+                prefix = _build_context_prefix()
                 response = drafting_agent.run(prefix + (message or "continue"), session_id=session_id)
-                print(response.content)
-                _update_draft_context(response, draft_context)
 
+                # confirm_draft is a pure signal. If the agent called it (even
+                # if it malformed the args — small models sometimes do), the
+                # user has approved: finalize deterministically from disk. Its
+                # own return ("confirmed") isn't worth printing.
                 if _was_tool_called(response, "confirm_draft"):
-                    print("\n(Draft finalized — type /scan to check it for quality.)")
-                if _was_tool_called(response, "confirm_upload"):
-                    print("\n(Uploaded — session reset for a new document.)")
+                    _finalize_from_disk()
+                    print("\n(Draft finalized — starting fresh for the next document.)")
+                else:
+                    print(response.content)
 
             elif active_agent == "/scan":
-                content = message if (matched_cmd == "/scan" and message) else draft_context["last_draft_content"]
+                content = message if (matched_cmd == "/scan" and message) else draft_workspace.read_working_draft()
                 if not content:
                     print("No document content available — paste it after /scan, or draft one first with /draft.")
                     continue
 
                 if matched_cmd == "/scan" and message:
-                    draft_context["last_draft_content"] = content
-                    draft_context["has_draft"] = True
+                    # Pasted content becomes the working draft so a later /draft can revise it.
+                    draft_workspace.write_working_draft(content)
 
                 response = scanner_agent.run(f"Score this document:\n\n{content}", session_id=session_id)
                 print(response.content)
-                _update_scan_context(response, draft_context)
-
-                if draft_context["last_scan_clean"]:
-                    print("\n(Scan clean — type /draft and confirm you'd like to upload.)")
-                else:
-                    print("\n(Issues found — type /draft to revise, then /scan again.)")
-                    if not draft_context["doc_type"] or not draft_context["stage"]:
-                        print("(Note: this document has no tracked type/stage yet — /draft will ask for it before revising.)")
 
             elif active_agent == "/rag":
                 print(rag_stub(message))
