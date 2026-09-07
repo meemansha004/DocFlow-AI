@@ -38,13 +38,6 @@ _ACTION_MIN_ROLE = {
     "approve_access_request": TeamRole.team_lead,
 }
 
-_SENSITIVITY_RANK = {
-    SensitivityLevel.public: 0,
-    SensitivityLevel.internal: 1,
-    SensitivityLevel.confidential: 2,
-}
-
-
 def _is_org_admin(db: Session, user_id: UUID) -> bool:
     user = db.get(User, user_id)
     return bool(user and user.is_org_admin)
@@ -141,12 +134,17 @@ def can_view_document(db: Session, user_id: UUID, document: Document) -> bool:
 
 def build_access_filter(db: Session, user_id: UUID, project_id: UUID):
     """
-    Returns a SQLAlchemy filter condition for querying documents within
-    a project, respecting tenant/project/team/sensitivity rules. For
-    org_admin/project_admin, returns a filter scoped only to tenant/project
-    (full visibility within that scope, no team/sensitivity restriction).
+    Returns a SQLAlchemy filter condition for querying documents within a
+    project — the COARSE narrowing only: tenant, project, and team-visibility.
+    Sensitivity is deliberately NOT filtered here; that decision belongs
+    entirely to can_view_document()'s per-row check (team_lead+ sees
+    confidential automatically, contributor only with an active grant, viewer
+    never). Callers must still run each returned row through can_view_document().
+
+    For org_admin/project_admin, returns a filter scoped only to
+    tenant/project (full visibility within that scope).
     """
-    from sqlalchemy import and_, or_
+    from sqlalchemy import and_
 
     user = db.get(User, user_id)
 
@@ -177,21 +175,41 @@ def build_access_filter(db: Session, user_id: UUID, project_id: UUID):
         Document.tenant_id == user.tenant_id,
         Document.project_id == project_id,
         Document.document_id.in_(visible_doc_ids_subquery),
-        or_(
-            Document.sensitivity_level.in_([SensitivityLevel.public, SensitivityLevel.internal]),
-            # confidential handled by can_view_document() at the row level after fetch —
-            # this filter is a coarse pre-filter, not the final authority for confidential docs
-        ),
+        # NOTE: no sensitivity condition — every doc visible to the user's
+        # teams (public, internal AND confidential) passes through here;
+        # can_view_document() makes the final per-row call.
     )
 
-def resolve_sensitivity(requested: str, role: str) -> SensitivityLevel:
+def _coerce_sensitivity(value: "SensitivityLevel | int | str") -> SensitivityLevel:
     """
-    Caps requested sensitivity by role. contributor capped at internal;
-    team_lead+/org_admin/project_admin can set confidential directly.
+    Accept a SensitivityLevel, its int value (0/1/2), or its name
+    (case-insensitive, e.g. "internal") — Phase 1 made SensitivityLevel an
+    IntEnum, so callers may hand us any of these forms.
     """
-    requested_level = SensitivityLevel(requested.lower())
-    if role in ("team_lead", "org_admin", "project_admin"):
+    if isinstance(value, SensitivityLevel):
+        return value
+    if isinstance(value, bool):  # bool is a subclass of int — reject explicitly
+        raise ValueError(f"Invalid sensitivity level: {value!r}")
+    if isinstance(value, int):
+        return SensitivityLevel(value)
+    if isinstance(value, str):
+        try:
+            return SensitivityLevel[value.strip().lower()]
+        except KeyError:
+            raise ValueError(f"Unknown sensitivity level: {value!r}") from None
+    raise ValueError(f"Unsupported sensitivity value: {value!r}")
+
+
+def resolve_sensitivity(requested: "SensitivityLevel | int | str", role: str) -> SensitivityLevel:
+    """
+    Caps requested sensitivity by role. viewer/contributor capped at internal;
+    team_lead+/org_admin/project_admin can set confidential directly. Because
+    SensitivityLevel is an IntEnum, the cap is a plain comparison.
+    """
+    requested_level = _coerce_sensitivity(requested)
+    role_name = role.value if hasattr(role, "value") else str(role)
+    if role_name in ("team_lead", "org_admin", "project_admin"):
         return requested_level
-    if _SENSITIVITY_RANK[requested_level] > _SENSITIVITY_RANK[SensitivityLevel.internal]:
+    if requested_level > SensitivityLevel.internal:
         return SensitivityLevel.internal
     return requested_level

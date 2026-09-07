@@ -1,3 +1,14 @@
+"""
+SUPERSEDED (Phase 3) — not registered in app.main anymore.
+
+The authenticated JSON upload path now lives in app/routers/documents.py
+(POST /documents/upload + GET /documents). This module is kept only for its
+multipart/file-bytes helpers (_validate_file, _resolve_uploading_as_team),
+which a future real file-upload endpoint can reuse. Its endpoint still uses
+the pre-auth `uploaded_by` / `tenant_id` form fields and is intentionally
+left unwired.
+"""
+
 import os
 import uuid
 

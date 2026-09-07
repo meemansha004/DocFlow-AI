@@ -1,11 +1,11 @@
 from fastapi import FastAPI
 
-from app.routers import upload, auth
+from app.routers import auth, documents
 
 app = FastAPI(title="DocFlow AI", version="0.1.0")
 
-app.include_router(upload.router)
 app.include_router(auth.router)
+app.include_router(documents.router)
 
 
 @app.get("/health")

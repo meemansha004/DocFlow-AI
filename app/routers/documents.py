@@ -1,0 +1,151 @@
+"""
+Phase 3: authenticated document endpoints.
+
+  POST /documents/upload  — create a document as the authenticated user,
+                            acting as one of their teams (team_id in body).
+                            Enforced by has_permission() inside create_document().
+  GET  /documents         — list documents in a project the caller can actually
+                            see, via build_access_filter() + can_view_document().
+"""
+
+import uuid
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel, Field
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from app.api.dependencies import get_current_user
+from app.database import get_db
+from app.models.document import Document
+from app.models.project import Project
+from app.models.team import Team
+from app.services.access_control import build_access_filter, can_view_document
+from app.services.auth import ResolvedIdentity
+from app.services.document_persistence import (
+    PermissionDeniedError,
+    StageNotFoundError,
+    create_document,
+)
+
+router = APIRouter(prefix="/documents", tags=["documents"])
+
+
+# --- models ----------------------------------------------------------------
+
+class DocumentUploadRequest(BaseModel):
+    document_type: str = Field(min_length=1, max_length=200)
+    stage_id: uuid.UUID
+    content: str = Field(min_length=1)
+    # Which of the caller's teams they are uploading as — required, since a
+    # user can belong to several teams (see erin: Engineering + Design).
+    team_id: uuid.UUID
+    sensitivity_level: str = "internal"  # "public" | "internal" | "confidential"
+
+
+class DocumentUploadResponse(BaseModel):
+    document_id: str
+    version_id: str
+    stage_id: str
+    stage_name: str
+    sensitivity_level: str
+    uploaded_as_team_id: str
+
+
+class DocumentListItem(BaseModel):
+    document_id: str
+    original_filename: str
+    project_id: str
+    stage_id: str
+    sensitivity_level: str
+    uploaded_as_team_id: str
+
+
+# --- helpers --------------------------------------------------------------
+
+def _effective_role(identity: ResolvedIdentity, team_id: uuid.UUID, project_id: uuid.UUID) -> str:
+    """
+    The role string create_document() needs to cap sensitivity. Mirrors the
+    precedence in has_permission(): org_admin > project_admin > per-team role.
+    """
+    if identity.is_org_admin:
+        return "org_admin"
+    if project_id in identity.project_admin_project_ids:
+        return "project_admin"
+    membership = next((m for m in identity.team_memberships if m.team_id == team_id), None)
+    return membership.role.value if membership else "viewer"
+
+
+# --- endpoints -----------------------------------------------------------
+
+@router.post("/upload", response_model=DocumentUploadResponse, status_code=201)
+def upload_document(
+    body: DocumentUploadRequest,
+    identity: ResolvedIdentity = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    team = db.get(Team, body.team_id)
+    if team is None:
+        raise HTTPException(status_code=404, detail="Team not found")
+
+    project = db.get(Project, team.project_id)
+    if project is None or project.tenant_id != identity.tenant_id:
+        raise HTTPException(status_code=403, detail="That team is not in your organization")
+
+    role = _effective_role(identity, body.team_id, project.project_id)
+
+    try:
+        created = create_document(
+            db,
+            user_id=identity.user_id,
+            team_id=body.team_id,
+            project_id=project.project_id,
+            role=role,
+            document_type=body.document_type,
+            stage_id=body.stage_id,
+            content=body.content,
+            sensitivity=body.sensitivity_level,
+        )
+    except PermissionDeniedError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except StageNotFoundError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ValueError as exc:  # bad sensitivity name, unknown user, etc.
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return DocumentUploadResponse(
+        document_id=str(created.document_id),
+        version_id=str(created.version_id),
+        stage_id=str(created.stage_id),
+        stage_name=created.stage_name,
+        sensitivity_level=created.sensitivity_level.name,
+        uploaded_as_team_id=str(body.team_id),
+    )
+
+
+@router.get("", response_model=list[DocumentListItem])
+def list_documents(
+    project_id: uuid.UUID = Query(..., description="Project to list documents for"),
+    identity: ResolvedIdentity = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    access_filter = build_access_filter(db, identity.user_id, project_id)
+    rows = db.execute(
+        select(Document).where(access_filter, Document.project_id == project_id)
+    ).scalars().all()
+
+    # Row-level refine: build_access_filter is a coarse pre-filter; the final
+    # authority (esp. for confidential) is can_view_document().
+    visible = [d for d in rows if can_view_document(db, identity.user_id, d)]
+
+    return [
+        DocumentListItem(
+            document_id=str(d.document_id),
+            original_filename=d.original_filename,
+            project_id=str(d.project_id),
+            stage_id=str(d.stage_id),
+            sensitivity_level=d.sensitivity_level.name,
+            uploaded_as_team_id=str(d.uploaded_as_team_id),
+        )
+        for d in visible
+    ]

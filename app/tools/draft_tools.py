@@ -7,7 +7,6 @@ from agno.tools import tool
 
 from app.services.draft_generator import draft_document as _draft_document
 from app.services.intent_extraction import extract_doc_type_and_stage as _extract
-from app.services.document_persistence import save_draft as _save_draft
 from app.services.document_persistence import create_document, PermissionDeniedError, StageNotFoundError
 
 @tool
@@ -76,9 +75,49 @@ def confirm_upload(document_type: str, stage: str, content: str) -> str:
                existing stage name)
         content: the final, approved document content in Markdown
     """
+    # WHO is uploading / AS WHICH team comes from the CLI session, never from
+    # the LLM's tool arguments. We read it here and pass it to create_document
+    # explicitly (create_document no longer reaches into session_context).
+    from app.database import SessionLocal
+    from app.models.stage import Stage
+    from app.services.session_context import get_current_session
+
+    session = get_current_session()
+    role = session["role"]
+    role_name = role.value if hasattr(role, "value") else str(role)
+
+    db = SessionLocal()
     try:
-        return create_document(document_type, stage, content)
+        stage_row = (
+            db.query(Stage)
+            .filter(
+                Stage.project_id == session["project_id"],
+                Stage.name.ilike(stage.strip()),
+                Stage.deleted_at.is_(None),
+            )
+            .first()
+        )
+        if stage_row is None:
+            return f"UPLOAD FAILED: No stage named '{stage}' exists in this project."
+
+        result = create_document(
+            db,
+            user_id=session["user_id"],
+            team_id=session["team_id"],
+            project_id=session["project_id"],
+            role=role_name,
+            document_type=document_type,
+            stage_id=stage_row.stage_id,
+            content=content,
+        )
+        return (
+            f"Document saved: '{document_type}' in stage '{result.stage_name}' "
+            f"(sensitivity: {result.sensitivity_level.name}). "
+            f"Document ID: {result.document_id}"
+        )
     except PermissionDeniedError as e:
         return f"UPLOAD BLOCKED: {e}"
     except StageNotFoundError as e:
         return f"UPLOAD FAILED: {e}"
+    finally:
+        db.close()

@@ -15,11 +15,11 @@ import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import RedirectResponse
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.api.dependencies import get_current_user
 from app.config import DEFAULT_SIGNUP_TENANT_ID
 from app.database import get_db
 from app.models.tenant import Tenant
@@ -34,16 +34,13 @@ from app.services.auth import (
     hash_password,
     oauth_state_cookie_kwargs,
     post_login_redirect_url,
-    resolve_identity,
     validate_oauth_state,
     verify_password,
-    verify_session_token,
 )
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 _OAUTH_STATE_COOKIE = "google_oauth_state"
-bearer_scheme = HTTPBearer(auto_error=False)
 
 
 # --- request / response models ----------------------------------------------
@@ -110,19 +107,6 @@ def _default_signup_tenant(db: Session) -> uuid.UUID:
             detail="DEFAULT_SIGNUP_TENANT_ID does not match any tenant",
         )
     return tenant_id
-
-
-def get_current_identity(
-    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
-    db: Session = Depends(get_db),
-) -> ResolvedIdentity:
-    if credentials is None:
-        raise HTTPException(status_code=401, detail="Not authenticated")
-    try:
-        user_id = uuid.UUID(verify_session_token(credentials.credentials))
-        return resolve_identity(db, user_id)
-    except ValueError as exc:
-        raise HTTPException(status_code=401, detail=str(exc)) from exc
 
 
 # --- endpoints --------------------------------------------------------------
@@ -197,7 +181,7 @@ def google_callback(code: str, state: str, request: Request, db: Session = Depen
 
 
 @router.get("/me", response_model=MeResponse)
-def me(identity: ResolvedIdentity = Depends(get_current_identity)):
+def me(identity: ResolvedIdentity = Depends(get_current_user)):
     return MeResponse(
         user_id=str(identity.user_id),
         email=identity.email,
