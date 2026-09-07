@@ -24,6 +24,14 @@ class User(Base):
     )
     email: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
     is_org_admin: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Local-auth fields — populated and used starting Phase 2 (password login +
+    # reset flow adopted from the teammate's implementation). Nullable so
+    # existing/external-identity users are unaffected until then.
+    password_hash: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    reset_token: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    reset_token_expires: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )

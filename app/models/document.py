@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from sqlalchemy import String, Integer, DateTime, ForeignKey, Enum, LargeBinary
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.types import TypeDecorator
 
 from sqlalchemy import Boolean, Text
 from sqlalchemy.dialects.postgresql import JSONB
@@ -12,12 +13,37 @@ from sqlalchemy.dialects.postgresql import JSONB
 from app.database import Base
 
 
-class SensitivityLevel(str, enum.Enum):
-    """Tiered sensitivity — used in ABAC clearance checks (user clearance >= doc level)."""
-    public = "public"
-    internal = "internal"
-    confidential = "confidential"
-   
+class SensitivityLevel(enum.IntEnum):
+    """
+    Tiered sensitivity — used in ABAC clearance checks (user clearance >= doc
+    level). An IntEnum so the check is a plain integer comparison
+    (public < internal < confidential) with no separate rank lookup, per the
+    merge decision (§1). Stored as a plain integer column (0/1/2), NOT a
+    Postgres enum type.
+    """
+    public = 0
+    internal = 1
+    confidential = 2
+
+
+class SensitivityLevelType(TypeDecorator):
+    """
+    Persists SensitivityLevel as its integer value (0/1/2) and hydrates it
+    back into a SensitivityLevel on load, so the mapped attribute stays a
+    proper enum member rather than a bare int.
+    """
+    impl = Integer
+    cache_ok = True
+
+    def process_bind_param(self, value, dialect):
+        if value is None:
+            return None
+        return int(SensitivityLevel(value))
+
+    def process_result_value(self, value, dialect):
+        if value is None:
+            return None
+        return SensitivityLevel(value)
 
 
 class DocumentStatus(str, enum.Enum):
@@ -63,7 +89,7 @@ class Document(Base):
         UUID(as_uuid=True), ForeignKey("teams.team_id"), nullable=False
     )
     sensitivity_level: Mapped[SensitivityLevel] = mapped_column(
-        Enum(SensitivityLevel, name="sensitivity_level"),
+        SensitivityLevelType,
         default=SensitivityLevel.internal,
         nullable=False,
     )
