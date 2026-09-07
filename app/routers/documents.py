@@ -20,6 +20,7 @@ from app.database import get_db
 from app.models.document import Document
 from app.models.project import Project
 from app.models.team import Team
+from app.models.workflow import WorkflowState
 from app.services.access_control import build_access_filter, can_view_document
 from app.services.auth import ResolvedIdentity
 from app.services.document_persistence import (
@@ -50,6 +51,8 @@ class DocumentUploadResponse(BaseModel):
     stage_name: str
     sensitivity_level: str
     uploaded_as_team_id: str
+    # "draft" if the stage requires approval, else null.
+    workflow_state: str | None
 
 
 class DocumentListItem(BaseModel):
@@ -59,21 +62,8 @@ class DocumentListItem(BaseModel):
     stage_id: str
     sensitivity_level: str
     uploaded_as_team_id: str
-
-
-# --- helpers --------------------------------------------------------------
-
-def _effective_role(identity: ResolvedIdentity, team_id: uuid.UUID, project_id: uuid.UUID) -> str:
-    """
-    The role string create_document() needs to cap sensitivity. Mirrors the
-    precedence in has_permission(): org_admin > project_admin > per-team role.
-    """
-    if identity.is_org_admin:
-        return "org_admin"
-    if project_id in identity.project_admin_project_ids:
-        return "project_admin"
-    membership = next((m for m in identity.team_memberships if m.team_id == team_id), None)
-    return membership.role.value if membership else "viewer"
+    # Current approval state, or null if the stage doesn't require approval.
+    workflow_state: str | None
 
 
 # --- endpoints -----------------------------------------------------------
@@ -92,7 +82,7 @@ def upload_document(
     if project is None or project.tenant_id != identity.tenant_id:
         raise HTTPException(status_code=403, detail="That team is not in your organization")
 
-    role = _effective_role(identity, body.team_id, project.project_id)
+    role = identity.role_on_team(body.team_id, project.project_id)
 
     try:
         created = create_document(
@@ -120,6 +110,7 @@ def upload_document(
         stage_name=created.stage_name,
         sensitivity_level=created.sensitivity_level.name,
         uploaded_as_team_id=str(body.team_id),
+        workflow_state=created.workflow_state,
     )
 
 
@@ -138,6 +129,15 @@ def list_documents(
     # authority (esp. for confidential) is can_view_document().
     visible = [d for d in rows if can_view_document(db, identity.user_id, d)]
 
+    wf_by_doc = {
+        w.document_id: w.state.value
+        for w in db.execute(
+            select(WorkflowState).where(
+                WorkflowState.document_id.in_([d.document_id for d in visible])
+            )
+        ).scalars()
+    } if visible else {}
+
     return [
         DocumentListItem(
             document_id=str(d.document_id),
@@ -146,6 +146,7 @@ def list_documents(
             stage_id=str(d.stage_id),
             sensitivity_level=d.sensitivity_level.name,
             uploaded_as_team_id=str(d.uploaded_as_team_id),
+            workflow_state=wf_by_doc.get(d.document_id),
         )
         for d in visible
     ]

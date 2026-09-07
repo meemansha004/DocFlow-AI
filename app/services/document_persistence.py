@@ -26,6 +26,7 @@ from app.models.document import (
 )
 from app.models.stage import Stage
 from app.models.user import User
+from app.models.workflow import WorkflowState, WorkflowStatus
 from app.services.access_control import has_permission, resolve_sensitivity
 
 
@@ -44,6 +45,9 @@ class CreatedDocument:
     stage_id: uuid.UUID
     stage_name: str
     sensitivity_level: SensitivityLevel
+    # "draft" when the stage requires approval (a WorkflowState row was created),
+    # None when it does not (no row — approval is not applicable).
+    workflow_state: str | None
 
 
 def create_document(
@@ -118,13 +122,21 @@ def create_document(
         file_data=content_bytes,
         file_size_bytes=len(content_bytes),
         uploaded_by=user_id,
-        status=DocumentStatus.indexed,  # already scanned clean before this is called
+        status=DocumentStatus.indexed,
     )
     db.add_all([doc, version])
     db.flush()  # so document_id / version_id are usable before commit
     doc.current_version_id = version_id
 
     db.add(DocumentTeamVisibility(document_id=document_id, team_id=team_id))
+
+    # Approval workflow (MERGE_DECISIONS §3/4): a WorkflowState row is created
+    # ONLY if this document's stage requires sign-off. No row == not applicable.
+    workflow_state: str | None = None
+    if stage.requires_approval:
+        db.add(WorkflowState(document_id=document_id, state=WorkflowStatus.draft))
+        workflow_state = WorkflowStatus.draft.value
+
     db.commit()
 
     return CreatedDocument(
@@ -133,4 +145,5 @@ def create_document(
         stage_id=stage.stage_id,
         stage_name=stage.name,
         sensitivity_level=final_sensitivity,
+        workflow_state=workflow_state,
     )

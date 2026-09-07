@@ -34,6 +34,11 @@ _ACTION_MIN_ROLE = {
     "view": TeamRole.viewer,
     "upload": TeamRole.contributor,
     "edit": TeamRole.contributor,
+    # Document approval workflow (MERGE_DECISIONS §3/4): submit is the same bar
+    # as upload; approve/reject require team_lead+ on that document's team.
+    "submit": TeamRole.contributor,
+    "approve": TeamRole.team_lead,
+    "reject": TeamRole.team_lead,
     "manage_team_members": TeamRole.team_lead,
     "approve_access_request": TeamRole.team_lead,
 }

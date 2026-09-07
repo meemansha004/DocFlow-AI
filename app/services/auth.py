@@ -269,6 +269,21 @@ class ResolvedIdentity:
     team_memberships: list[TeamMembership]
     project_admin_project_ids: list[uuid.UUID]
 
+    def role_on_team(self, team_id: uuid.UUID, project_id: uuid.UUID) -> str:
+        """
+        The effective role string for permission / sensitivity decisions, in the
+        same precedence has_permission() uses:
+          org_admin > project_admin > per-team role > (no membership -> viewer)
+        """
+        if self.is_org_admin:
+            return "org_admin"
+        if project_id in self.project_admin_project_ids:
+            return "project_admin"
+        membership = next(
+            (m for m in self.team_memberships if m.team_id == team_id), None
+        )
+        return membership.role.value if membership else "viewer"
+
 
 def resolve_identity(db: Session, user_id: uuid.UUID) -> ResolvedIdentity:
     """
