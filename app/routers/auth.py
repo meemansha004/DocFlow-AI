@@ -24,6 +24,7 @@ from app.config import DEFAULT_SIGNUP_TENANT_ID
 from app.database import get_db
 from app.models.tenant import Tenant
 from app.models.user import User
+from app.services.audit import record_audit
 from app.services.auth import (
     ResolvedIdentity,
     create_oauth_state,
@@ -121,6 +122,9 @@ def signup(body: SignupRequest, db: Session = Depends(get_db)):
 
     user = User(email=email, tenant_id=tenant_id, password_hash=hash_password(body.password))
     db.add(user)
+    db.flush()
+    record_audit(db, actor_id=user.user_id, action="SIGNUP", resource_type="user",
+                 resource_id=user.user_id, details={"method": "password"})
     db.commit()
     db.refresh(user)
 
@@ -135,6 +139,9 @@ def login(body: LoginRequest, db: Session = Depends(get_db)):
     user = db.execute(select(User).where(User.email == email)).scalar_one_or_none()
     if user is None or not user.password_hash or not verify_password(body.password, user.password_hash):
         raise HTTPException(status_code=401, detail="Invalid email or password")
+    record_audit(db, actor_id=user.user_id, action="LOGIN", resource_type="user",
+                 resource_id=user.user_id, details={"method": "password"})
+    db.commit()
     return TokenResponse(access_token=create_session_token(str(user.user_id)))
 
 
@@ -169,8 +176,13 @@ def google_callback(code: str, state: str, request: Request, db: Session = Depen
         tenant_id = _default_signup_tenant(db)
         user = User(email=email, tenant_id=tenant_id, password_hash=None)
         db.add(user)
-        db.commit()
-        db.refresh(user)
+        db.flush()
+        record_audit(db, actor_id=user.user_id, action="SIGNUP", resource_type="user",
+                     resource_id=user.user_id, details={"method": "google"})
+    record_audit(db, actor_id=user.user_id, action="LOGIN", resource_type="user",
+                 resource_id=user.user_id, details={"method": "google"})
+    db.commit()
+    db.refresh(user)
 
     token = create_session_token(str(user.user_id))
     redirect = RedirectResponse(

@@ -1,6 +1,12 @@
 # Environment — NEVER commit secrets
 venv/
 .env
+frontend/.env
+frontend/.env.local
+
+# Frontend build artifacts
+frontend/node_modules/
+frontend/dist/
 
 # Python
 __pycache__/

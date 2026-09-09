@@ -1,0 +1,83 @@
+@import "tailwindcss";
+@config "../tailwind.config.js";
+
+@layer base {
+  :root {
+    font-family: 'Segoe UI', sans-serif;
+    color: #e5e7eb;
+    background: #0F1115;
+  }
+
+  html {
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+  }
+
+  html::-webkit-scrollbar {
+    display: none;
+  }
+
+  * {
+    border-color: #2E323E;
+  }
+
+  body {
+    @apply bg-background text-gray-200 antialiased min-h-screen;
+    background-image: radial-gradient(circle at 12% 0%, rgba(139, 92, 246, 0.1), transparent 28rem), radial-gradient(circle at 92% 8%, rgba(59, 130, 246, 0.08), transparent 24rem);
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+  }
+
+  body::-webkit-scrollbar {
+    display: none;
+  }
+
+  .scrollbar-hidden {
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+  }
+
+  .scrollbar-hidden::-webkit-scrollbar {
+    display: none;
+  }
+
+  button, input, textarea {
+    font: inherit;
+  }
+
+  .text-gray-100 { color: #f3f4f6; }
+  .text-gray-200 { color: #e5e7eb; }
+  .text-gray-300 { color: #d1d5db; }
+  .text-gray-400 { color: #9ca3af; }
+  .text-gray-500 { color: #6b7280; }
+  .text-gray-600 { color: #4b5563; }
+  .text-primary-light { color: #A78BFA; }
+
+  body.light-theme {
+    color: #1f2937;
+    background: #f5f7fb;
+  }
+
+  body.light-theme {
+    background: #f5f7fb;
+    background-image: radial-gradient(circle at 12% 0%, rgba(139, 92, 246, 0.08), transparent 28rem), radial-gradient(circle at 92% 8%, rgba(59, 130, 246, 0.06), transparent 24rem);
+  }
+
+  body.light-theme { background-color: #f5f7fb !important; }
+  body.light-theme .bg-background { background-color: #f5f7fb !important; }
+  body.light-theme .card-footer { background-color: transparent !important; }
+  body.light-theme .bg-surface { background-color: #ffffff !important; }
+  body.light-theme .bg-surface\/95 { background-color: rgba(255, 255, 255, 0.95) !important; }
+  body.light-theme .bg-surface-hover { background-color: #eef2f7 !important; }
+  body.light-theme .border-border { border-color: #d8dee9 !important; }
+  body.light-theme .text-gray-100 { color: #111827 !important; }
+  body.light-theme .text-gray-200 { color: #1f2937 !important; }
+  body.light-theme .text-gray-300 { color: #374151 !important; }
+  body.light-theme .text-gray-400 { color: #4b5563 !important; }
+  body.light-theme .text-gray-500 { color: #64748b !important; }
+  body.light-theme .text-gray-600 { color: #94a3b8 !important; }
+  body.light-theme input,
+  body.light-theme textarea,
+  body.light-theme select { color: #1f2937 !important; background-color: #ffffff !important; }
+  body.light-theme .text-primary-light { color: #6d28d9 !important; }
+}

@@ -1,0 +1,117 @@
+import React, { createContext, useContext, useEffect, useState, useCallback } from 'react';
+import { authApi, getToken, setToken, clearWorkspaceCache } from '../lib/api';
+
+const AuthContext = createContext(null);
+
+// eslint-disable-next-line react-refresh/only-export-components
+export const useAuth = () => useContext(AuthContext);
+
+// Our /auth/me returns team_memberships[] + project_admin_project_ids[].
+// His pages read user.project_roles[projectId] and user.is_org_admin, so derive
+// a per-project "best role" map in our own vocabulary
+// (viewer < contributor < team_lead, plus project_admin).
+const RANK = { viewer: 1, contributor: 2, team_lead: 3, project_admin: 4 };
+function withProjectRoles(me) {
+  const roles = {};
+  for (const m of me.team_memberships || []) {
+    if (!roles[m.project_id] || RANK[m.role] > RANK[roles[m.project_id]]) {
+      roles[m.project_id] = m.role;
+    }
+  }
+  for (const pid of me.project_admin_project_ids || []) roles[pid] = 'project_admin';
+  // his TopNav / pages read user.username / user.full_name / user.role — we only
+  // have email, so alias it so his UI shows something sensible.
+  return {
+    ...me,
+    project_roles: roles,
+    username: me.email,
+    full_name: me.email,
+    role: me.is_org_admin ? 'org_admin' : (Object.values(roles)[0] || 'member'),
+  };
+}
+
+export const AuthProvider = ({ children }) => {
+  const [user, setUser] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  const loadUser = useCallback(async () => {
+    if (!getToken()) {
+      setUser(null);
+      setLoading(false);
+      return;
+    }
+    try {
+      clearWorkspaceCache();
+      setUser(withProjectRoles(await authApi.me()));
+    } catch {
+      setToken(null);
+      setUser(null);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  // Capture ?auth_token=... from the Google OAuth callback redirect.
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const incoming = params.get('auth_token');
+    if (incoming) {
+      setToken(incoming);
+      params.delete('auth_token');
+      params.delete('is_new_user');
+      const clean = window.location.pathname + (params.toString() ? `?${params}` : '');
+      window.history.replaceState({}, '', clean);
+    }
+    loadUser();
+  }, [loadUser]);
+
+  const login = async (email, password) => {
+    const { access_token } = await authApi.login(email, password);
+    setToken(access_token);
+    await loadUser();
+  };
+
+  const signup = async (data) => {
+    const { access_token } = await authApi.signup(data);
+    setToken(access_token);
+    await loadUser();
+  };
+
+  // Kept so his "Continue as Super Admin" button still renders; the call
+  // rejects with a "not connected" message that his LoginPage surfaces.
+  const loginSuperAdmin = async () => {
+    const { access_token } = await authApi.superAdmin();
+    setToken(access_token);
+    await loadUser();
+  };
+
+  const loginWithGoogle = async () => {
+    const { authorization_url } = await authApi.googleAuthorize();
+    window.location.href = authorization_url;
+  };
+
+  const logout = () => {
+    clearWorkspaceCache();
+    setToken(null);
+    setUser(null);
+  };
+
+  return (
+    <AuthContext.Provider
+      value={{
+        user,
+        loading,
+        isAuthenticated: !!user,
+        login,
+        signup,
+        loginSuperAdmin,
+        loginDemo: loginSuperAdmin,
+        loginWithGoogle,
+        logout,
+        refresh: loadUser,
+      }}
+    >
+      {children}
+    </AuthContext.Provider>
+  );
+};

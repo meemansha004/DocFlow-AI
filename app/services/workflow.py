@@ -36,6 +36,7 @@ from sqlalchemy.orm import Session
 
 from app.models.workflow import WorkflowState, WorkflowStatus
 from app.services.access_control import has_permission
+from app.services.audit import record_audit
 
 
 class WorkflowError(Exception):
@@ -89,6 +90,10 @@ def submit_for_review(
     if state.state == WorkflowStatus.rejected:
         state.rejection_reason = None  # the previous rejection no longer applies
     state.state = WorkflowStatus.pending_review
+    record_audit(
+        db, actor_id=user_id, action="SUBMIT_DOCUMENT", resource_type="document",
+        resource_id=document_id, details={"state": "pending_review"},
+    )
     db.commit()
     return state
 
@@ -115,6 +120,10 @@ def approve_document(
     state.approved_by = approver_id
     state.approval_timestamp = datetime.now(timezone.utc)
     state.rejection_reason = None
+    record_audit(
+        db, actor_id=approver_id, action="APPROVE_DOCUMENT", resource_type="document",
+        resource_id=document_id, details={"state": "approved"},
+    )
     db.commit()
     return state
 
@@ -145,5 +154,9 @@ def reject_document(
         )
     state.state = WorkflowStatus.rejected
     state.rejection_reason = reason.strip()
+    record_audit(
+        db, actor_id=approver_id, action="REJECT_DOCUMENT", resource_type="document",
+        resource_id=document_id, details={"state": "rejected", "reason": reason.strip()},
+    )
     db.commit()
     return state

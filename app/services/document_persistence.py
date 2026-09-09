@@ -28,6 +28,7 @@ from app.models.stage import Stage
 from app.models.user import User
 from app.models.workflow import WorkflowState, WorkflowStatus
 from app.services.access_control import has_permission, resolve_sensitivity
+from app.services.audit import record_audit
 
 
 class PermissionDeniedError(Exception):
@@ -137,6 +138,16 @@ def create_document(
         db.add(WorkflowState(document_id=document_id, state=WorkflowStatus.draft))
         workflow_state = WorkflowStatus.draft.value
 
+    record_audit(
+        db, actor_id=user_id, action="UPLOAD_DOCUMENT", resource_type="document",
+        resource_id=document_id,
+        details={
+            "stage_id": str(stage.stage_id),
+            "team_id": str(team_id),
+            "sensitivity": final_sensitivity.name,
+            "workflow_state": workflow_state or "none",
+        },
+    )
     db.commit()
 
     return CreatedDocument(

@@ -23,6 +23,9 @@ class User(Base):
         UUID(as_uuid=True), ForeignKey("tenants.tenant_id"), nullable=False
     )
     email: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
+    # Human-readable name for the admin user directory. Nullable — the UI falls
+    # back to the email when it's missing.
+    full_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     is_org_admin: Mapped[bool] = mapped_column(Boolean, default=False)
     # Local-auth fields — populated and used starting Phase 2 (password login +
     # reset flow adopted from the teammate's implementation). Nullable so
