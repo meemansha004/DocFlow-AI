@@ -200,6 +200,15 @@ export const stagesApi = {
     clearWorkspaceCache();
     return r;
   },
+  // Replace this stage's full set of outbound references (stage_ids, same project).
+  setReferences: async (projectId, stageId, references) => {
+    const r = await request(
+      `/projects/${encodeURIComponent(projectId)}/stages/${encodeURIComponent(stageId)}/references`,
+      { method: 'PUT', body: { references } },
+    );
+    clearWorkspaceCache();
+    return r;
+  },
 };
 
 // ---------- Documents ----------

@@ -2,7 +2,7 @@ from app.models.tenant import Tenant
 from app.models.user import User
 from app.models.project import Project
 from app.models.team import Team, UserTeamMembership, ProjectAdmin, AccessRequest
-from app.models.stage import Stage
+from app.models.stage import Stage, StageReference
 from app.models.required_document import RequiredDocument
 from app.models.document import (
     Document,

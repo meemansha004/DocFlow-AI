@@ -1,7 +1,15 @@
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import String, Integer, DateTime, ForeignKey, Boolean
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    UniqueConstraint,
+)
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -39,6 +47,42 @@ class Stage(Base):
     )
     deleted_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True, default=None
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+
+
+class StageReference(Base):
+    """
+    A ONE-WAY structural link: stage `stage_id` references stage
+    `references_stage_id`. RAG retrieval scoped to a stage can then also pull
+    content from the stages it references (e.g. "Testing" -> "Requirements").
+
+    Directional: A -> B does NOT imply B -> A. Both stages MUST belong to the
+    same project (enforced in the API, not by FK). A stage cannot reference
+    itself (DB CHECK + API guard). No duplicate (stage_id, references_stage_id)
+    pairs (unique constraint).
+
+    This REPLACES the never-used `document_stage_references` concept — that
+    table stays in the schema, unused, nothing new is built against it.
+    """
+    __tablename__ = "stage_references"
+    __table_args__ = (
+        UniqueConstraint("stage_id", "references_stage_id", name="uq_stage_reference"),
+        CheckConstraint(
+            "stage_id <> references_stage_id", name="ck_stage_reference_not_self"
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    stage_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("stages.stage_id"), nullable=False
+    )
+    references_stage_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("stages.stage_id"), nullable=False
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)

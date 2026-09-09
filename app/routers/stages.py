@@ -30,7 +30,7 @@ from app.api.dependencies import get_current_user
 from app.database import get_db
 from app.models.document import Document
 from app.models.project import Project
-from app.models.stage import Stage
+from app.models.stage import Stage, StageReference
 from app.services.audit import record_audit
 from app.services.auth import ResolvedIdentity
 
@@ -51,6 +51,11 @@ class UpdateStageRequest(BaseModel):
     requires_approval: bool | None = None
 
 
+class SetStageReferencesRequest(BaseModel):
+    # The FULL desired set of stages this stage references (replace, not append).
+    references: list[uuid.UUID] = Field(default_factory=list)
+
+
 class StageOut(BaseModel):
     stage_id: str
     project_id: str
@@ -58,6 +63,8 @@ class StageOut(BaseModel):
     order_index: int
     requires_approval: bool
     document_count: int
+    # Stage IDs this stage references (one-way, same project). Drives RAG scope.
+    references: list[str] = Field(default_factory=list)
 
 
 # --- helpers ---------------------------------------------------------------
@@ -108,7 +115,19 @@ def _doc_counts(db: Session, project_id: uuid.UUID) -> dict[uuid.UUID, int]:
     return {sid: n for sid, n in rows}
 
 
-def _serialize(stage: Stage, doc_count: int) -> StageOut:
+def _refs_by_stage(db: Session, stage_ids: list[uuid.UUID]) -> dict[uuid.UUID, list[uuid.UUID]]:
+    """{stage_id: [referenced stage_id, ...]} for the given stages."""
+    out: dict[uuid.UUID, list[uuid.UUID]] = {sid: [] for sid in stage_ids}
+    if not stage_ids:
+        return out
+    for r in db.execute(
+        select(StageReference).where(StageReference.stage_id.in_(stage_ids))
+    ).scalars():
+        out.setdefault(r.stage_id, []).append(r.references_stage_id)
+    return out
+
+
+def _serialize(stage: Stage, doc_count: int, refs: list[uuid.UUID] | None = None) -> StageOut:
     return StageOut(
         stage_id=str(stage.stage_id),
         project_id=str(stage.project_id),
@@ -116,6 +135,7 @@ def _serialize(stage: Stage, doc_count: int) -> StageOut:
         order_index=stage.order_index,
         requires_approval=stage.requires_approval,
         document_count=doc_count,
+        references=[str(x) for x in (refs or [])],
     )
 
 
@@ -131,7 +151,12 @@ def list_stages(
     if not _can_see_project(db, identity, project_id):
         raise HTTPException(status_code=403, detail="You do not have access to this project")
     counts = _doc_counts(db, project_id)
-    return [_serialize(s, counts.get(s.stage_id, 0)) for s in _active_stages(db, project_id)]
+    stages = _active_stages(db, project_id)
+    refs = _refs_by_stage(db, [s.stage_id for s in stages])
+    return [
+        _serialize(s, counts.get(s.stage_id, 0), refs.get(s.stage_id, []))
+        for s in stages
+    ]
 
 
 @router.post("/{project_id}/stages", response_model=StageOut, status_code=201)
@@ -169,7 +194,7 @@ def create_stage(
     )
     db.commit()
     db.refresh(stage)
-    return _serialize(stage, 0)
+    return _serialize(stage, 0, [])
 
 
 @router.patch("/{project_id}/stages/{stage_id}", response_model=StageOut)
@@ -215,7 +240,8 @@ def update_stage(
 
     if not changed:
         counts = _doc_counts(db, project_id)
-        return _serialize(stage, counts.get(stage_id, 0))
+        return _serialize(stage, counts.get(stage_id, 0),
+                          _refs_by_stage(db, [stage_id])[stage_id])
 
     record_audit(
         db, actor_id=identity.user_id, action="UPDATE_STAGE", resource_type="stage",
@@ -226,7 +252,8 @@ def update_stage(
     db.commit()
     db.refresh(stage)
     counts = _doc_counts(db, project_id)
-    return _serialize(stage, counts.get(stage_id, 0))
+    return _serialize(stage, counts.get(stage_id, 0),
+                      _refs_by_stage(db, [stage_id])[stage_id])
 
 
 @router.delete("/{project_id}/stages/{stage_id}")
@@ -280,6 +307,14 @@ def delete_stage(
     remaining = [s for s in stages if s.stage_id != stage_id]
     _renumber(remaining)
 
+    # Drop any stage-reference links this stage was on either side of — a
+    # deleted stage should not linger in another stage's RAG scope, and its
+    # own outbound references are meaningless now.
+    db.query(StageReference).filter(
+        (StageReference.stage_id == stage_id)
+        | (StageReference.references_stage_id == stage_id)
+    ).delete(synchronize_session=False)
+
     record_audit(
         db, actor_id=identity.user_id, action="DELETE_STAGE", resource_type="stage",
         resource_id=stage.stage_id,
@@ -291,3 +326,58 @@ def delete_stage(
     )
     db.commit()
     return {"status": "deleted", "stage_id": str(stage_id), "reassigned_documents": reassigned}
+
+
+@router.put("/{project_id}/stages/{stage_id}/references", response_model=StageOut)
+def set_stage_references(
+    project_id: uuid.UUID,
+    stage_id: uuid.UUID,
+    body: SetStageReferencesRequest,
+    identity: ResolvedIdentity = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Replace this stage's full set of outbound references. One-way (A->B does not
+    imply B->A). Every referenced stage must be another ACTIVE stage in the SAME
+    project; a stage cannot reference itself.
+    """
+    _load_project(db, identity, project_id)
+    _require_project_admin(identity, project_id)
+
+    stages = _active_stages(db, project_id)
+    stage = next((s for s in stages if s.stage_id == stage_id), None)
+    if stage is None:
+        raise HTTPException(status_code=404, detail="Stage not found")
+
+    active_ids = {s.stage_id for s in stages}
+    wanted: list[uuid.UUID] = []
+    for ref_id in body.references:
+        if ref_id in wanted:
+            continue  # dedupe silently
+        if ref_id == stage_id:
+            raise HTTPException(status_code=422, detail="A stage cannot reference itself")
+        if ref_id not in active_ids:
+            # missing, soft-deleted, or in another project — all rejected the same
+            raise HTTPException(
+                status_code=422,
+                detail="A referenced stage must be another active stage in this project",
+            )
+        wanted.append(ref_id)
+
+    current = set(_refs_by_stage(db, [stage_id])[stage_id])
+    if current != set(wanted):
+        db.query(StageReference).filter(StageReference.stage_id == stage_id).delete(
+            synchronize_session=False
+        )
+        for ref_id in wanted:
+            db.add(StageReference(stage_id=stage_id, references_stage_id=ref_id))
+        record_audit(
+            db, actor_id=identity.user_id, action="UPDATE_STAGE_REFERENCES",
+            resource_type="stage", resource_id=stage_id,
+            details={"project_id": str(project_id),
+                     "references": ",".join(str(x) for x in wanted) or "(none)"},
+        )
+        db.commit()
+
+    counts = _doc_counts(db, project_id)
+    return _serialize(stage, counts.get(stage_id, 0), wanted)

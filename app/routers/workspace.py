@@ -20,7 +20,7 @@ from sqlalchemy.orm import Session
 from app.api.dependencies import get_current_user
 from app.database import get_db
 from app.models.project import Project
-from app.models.stage import Stage
+from app.models.stage import Stage, StageReference
 from app.models.team import Team
 from app.services.auth import ResolvedIdentity
 
@@ -38,6 +38,7 @@ class StageOut(BaseModel):
     name: str
     order_index: int
     requires_approval: bool
+    references: list[str] = []  # stage_ids this stage references (one-way)
 
 
 class ProjectOut(BaseModel):
@@ -106,6 +107,13 @@ def get_workspace(
             .where(Stage.project_id == pid, Stage.deleted_at.is_(None))
             .order_by(Stage.order_index)
         ).scalars().all()
+        refs_by_stage: dict[uuid.UUID, list[str]] = {}
+        for sr in db.execute(
+            select(StageReference).where(
+                StageReference.stage_id.in_([s.stage_id for s in stages])
+            )
+        ).scalars():
+            refs_by_stage.setdefault(sr.stage_id, []).append(str(sr.references_stage_id))
 
         projects_out.append(ProjectOut(
             project_id=str(pid),
@@ -117,6 +125,7 @@ def get_workspace(
                     name=s.name,
                     order_index=s.order_index,
                     requires_approval=s.requires_approval,
+                    references=refs_by_stage.get(s.stage_id, []),
                 )
                 for s in stages
             ],

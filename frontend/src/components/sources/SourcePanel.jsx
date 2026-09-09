@@ -1,5 +1,5 @@
 import React, { useMemo, useState } from 'react';
-import { Plus, Pencil, ArrowUp, ArrowDown, ShieldCheck, Trash2, Settings2 } from 'lucide-react';
+import { Plus, Pencil, ArrowUp, ArrowDown, ShieldCheck, Trash2, Settings2, Link2 } from 'lucide-react';
 import { STAGES } from '../../constants/stages';
 import StageSection from './StageSection';
 import KebabMenu from '../ui/KebabMenu';
@@ -51,6 +51,7 @@ const SourcePanel = ({
   const [settingsStage, setSettingsStage] = useState(null);
   const [editName, setEditName] = useState('');
   const [reqApproval, setReqApproval] = useState(false);
+  const [refIds, setRefIds] = useState([]); // stage_ids this stage references
   const [reassignTo, setReassignTo] = useState('');
   const [stageBusy, setStageBusy] = useState(false);
   const [stageErr, setStageErr] = useState('');
@@ -64,6 +65,7 @@ const SourcePanel = ({
     setSettingsStage(stage);
     setEditName(stage.name);
     setReqApproval(Boolean(stage.requires_approval));
+    setRefIds(stage.references || []);
     setReassignTo('');
     setStageErr(''); setStageNotice('');
   };
@@ -92,10 +94,31 @@ const SourcePanel = ({
       setSettingsStage(updated);
       setEditName(updated.name);
       setReqApproval(Boolean(updated.requires_approval));
+      setRefIds(updated.references || []);
       if (successMsg) setStageNotice(successMsg);
       await refresh();
     } catch (err) {
       setStageErr(err.message || 'Could not update the stage.');
+    } finally {
+      setStageBusy(false);
+    }
+  };
+
+  const toggleReference = async (targetId) => {
+    const next = refIds.includes(targetId)
+      ? refIds.filter((id) => id !== targetId)
+      : [...refIds, targetId];
+    setRefIds(next); // optimistic
+    setStageBusy(true); setStageErr(''); setStageNotice('');
+    try {
+      const updated = await stagesApi.setReferences(projectId, settingsStage.stage_id, next);
+      setSettingsStage(updated);
+      setRefIds(updated.references || []);
+      setStageNotice('References updated.');
+      await refresh();
+    } catch (err) {
+      setRefIds(refIds); // roll back
+      setStageErr(err.message || 'Could not update references.');
     } finally {
       setStageBusy(false);
     }
@@ -293,6 +316,40 @@ const SourcePanel = ({
               >
                 <span className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${reqApproval ? 'translate-x-4' : 'translate-x-0.5'}`} />
               </button>
+            </div>
+
+            {/* Stage references */}
+            <div className="border-t border-border/60 pt-4">
+              <p className="text-sm font-medium text-gray-300 flex items-center gap-1.5">
+                <Link2 size={14} className="text-primary" /> References
+              </p>
+              <p className="text-xs text-gray-500 mt-0.5 mb-2">
+                Other stages this one depends on. Retrieval scoped to
+                &ldquo;{settingsStage.name}&rdquo; also pulls from these (one-way).
+              </p>
+              {orderedStages.filter((s) => s.stage_id !== settingsStage.stage_id).length === 0 ? (
+                <p className="text-xs text-gray-600">No other stages in this project.</p>
+              ) : (
+                <div className="space-y-1">
+                  {orderedStages
+                    .filter((s) => s.stage_id !== settingsStage.stage_id)
+                    .map((s) => (
+                      <label
+                        key={s.stage_id}
+                        className="flex items-center gap-2 rounded-md px-2 py-1.5 text-sm text-gray-300 hover:bg-surface-hover cursor-pointer"
+                      >
+                        <input
+                          type="checkbox"
+                          className="accent-primary"
+                          disabled={stageBusy}
+                          checked={refIds.includes(s.stage_id)}
+                          onChange={() => toggleReference(s.stage_id)}
+                        />
+                        {s.name}
+                      </label>
+                    ))}
+                </div>
+              )}
             </div>
 
             {/* Delete */}
