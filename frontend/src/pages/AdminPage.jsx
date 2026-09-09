@@ -2,7 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { Link, Navigate, useSearchParams } from 'react-router-dom';
 import { ArrowLeft, ShieldCheck, Users, ClipboardList, ScrollText, FlaskConical, Check, X, Clock3, Trash2, Search, ChevronDown } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
-import { adminApi, projectsApi, documentsApi, workspaceApi, accessRequestsApi } from '../lib/api';
+import { adminApi, projectsApi, documentsApi, workspaceApi, accessRequestsApi, activityApi } from '../lib/api';
 import Button from '../components/ui/Button';
 import Input from '../components/ui/Input';
 import Dropdown from '../components/ui/Dropdown';
@@ -74,10 +74,21 @@ const AdminPage = () => {
   // team_lead / project_admin can review (approve documents, decide access requests)
   // within their own scope; the backend still enforces the per-team check.
   const REVIEW_ROLES = ['team_lead', 'project_admin', 'admin'];
-  const hasApprovalAccess = isOrgAdmin
-    || Object.values(user?.project_roles || {}).some((role) => REVIEW_ROLES.includes(role));
+  const roleValues = Object.values(user?.project_roles || {});
+  const isProjectAdminAnywhere = roleValues.includes('project_admin');
+  const isTeamLeadAnywhere = roleValues.includes('team_lead');
+  const hasApprovalAccess = isOrgAdmin || roleValues.some((role) => REVIEW_ROLES.includes(role));
+  // Finalized access design:
+  //   Audit Log     -> org_admin, project_admin, team_lead   (contributor/viewer: none)
+  //   Project Activity -> everyone EXCEPT a viewer-only user  (i.e. any contributor+ role)
+  const canViewAudit = isOrgAdmin || isProjectAdminAnywhere || isTeamLeadAnywhere;
+  const canViewActivity = isOrgAdmin
+    || roleValues.some((role) => ['contributor', 'team_lead', 'project_admin'].includes(role));
+  const canManageUsers = isOrgAdmin || isProjectAdminAnywhere || isTeamLeadAnywhere;
   const availableTabs = TABS.filter((tab) => {
-    if (tab.id === 'audit' || tab.id === 'activity') return isOrgAdmin;
+    if (tab.id === 'users' || tab.id === 'rbac') return canManageUsers;
+    if (tab.id === 'audit') return canViewAudit;
+    if (tab.id === 'activity') return canViewActivity;
     if (tab.id === 'approvals') return hasApprovalAccess;
     return true;
   });
@@ -95,8 +106,8 @@ const AdminPage = () => {
     if (!availableTabs.some((item) => item.id === tab)) setTab(availableTabs[0]?.id || 'users');
   }, [tab, availableTabs]);
 
-  const canManageProjects = isOrgAdmin || Object.values(user?.project_roles || {}).some((role) => ['admin', 'team_lead'].includes(role));
-  if (!canManageProjects) {
+  const canReachAdmin = canManageUsers || canViewAudit || canViewActivity || hasApprovalAccess;
+  if (!canReachAdmin) {
     return <Navigate to="/" replace />;
   }
 
@@ -128,77 +139,179 @@ const AdminPage = () => {
         ))}
       </div>
 
-      {tab === 'users' && <UsersTab currentUser={user} initialProjectId={requestedProjectId} />}
-      {tab === 'approvals' && <ApprovalsTab projects={visibleProjects} />}
-      {tab === 'audit' && isOrgAdmin && <AuditTab />}
-      {tab === 'activity' && isOrgAdmin && <ProjectActivityTab projects={visibleProjects} />}
-      {tab === 'rbac' && <RbacTab />}
+      {tab === 'users' && canManageUsers && <UsersTab currentUser={user} initialProjectId={requestedProjectId} />}
+      {tab === 'approvals' && hasApprovalAccess && <ApprovalsTab projects={visibleProjects} />}
+      {tab === 'audit' && canViewAudit && <AuditTab />}
+      {tab === 'activity' && canViewActivity && <ProjectActivityTab />}
+      {tab === 'rbac' && canManageUsers && <RbacTab />}
     </div>
   );
 };
 
-const ProjectActivityTab = ({ projects }) => {
-  const [projectId, setProjectId] = useState('');
-  const [data, setData] = useState(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState('');
+// Outcome/status -> Badge variant (shared by Project Activity + Audit Log).
+const STATUS_VARIANT = {
+  approved: 'success',
+  rejected: 'danger',
+  denied: 'danger',
+  pending: 'warning',
+  pending_review: 'warning',
+  draft: 'neutral',
+};
+const statusVariant = (s) => STATUS_VARIANT[s] || 'neutral';
 
-  const load = async (value) => {
-    setProjectId(value);
-    setData(null);
-    if (!value) return;
-    setLoading(true);
-    setError('');
+// Finalized Project Activity design:
+//   project cards (only projects you're part of)
+//     -> single-select team dropdown
+//       -> flat activity list for that team, each entry showing its stage +
+//          a workflow outcome. Entries tied to a confidential document only
+//          appear if the backend's can_view_document() passes for you — team
+//          membership alone does not bypass sensitivity clearance.
+const ProjectActivityTab = () => {
+  const [projects, setProjects] = useState(null);
+  const [loadError, setLoadError] = useState('');
+  const [openProject, setOpenProject] = useState(null);
+  const [teamId, setTeamId] = useState('');
+  const [feed, setFeed] = useState(null);
+  const [feedLoading, setFeedLoading] = useState(false);
+  const [feedError, setFeedError] = useState('');
+
+  useEffect(() => {
+    activityApi.projects()
+      .then(setProjects)
+      .catch((err) => setLoadError(err.message || 'Could not load projects.'));
+  }, []);
+
+  const enterProject = (project) => {
+    setOpenProject(project);
+    setTeamId('');
+    setFeed(null);
+    setFeedError('');
+  };
+
+  const pickTeam = async (nextTeamId) => {
+    setTeamId(nextTeamId);
+    setFeed(null);
+    setFeedError('');
+    if (!nextTeamId) return;
+    setFeedLoading(true);
     try {
-      setData(await projectsApi.activity(value));
+      setFeed(await activityApi.feed(openProject.project_id, nextTeamId));
     } catch (err) {
-      setError(err.message || 'Could not load project activity.');
+      setFeedError(err.message || 'Could not load activity for this team.');
     } finally {
-      setLoading(false);
+      setFeedLoading(false);
     }
   };
 
-  const projectOptions = projects.map((project) => ({ label: project.project_name, value: project.project_id }));
+  if (loadError) return <p className="text-sm text-red-400">{loadError}</p>;
+  if (projects === null) {
+    return (
+      <div className="flex justify-center py-8">
+        <div className="w-6 h-6 border-4 border-primary/30 border-t-primary rounded-full animate-spin" />
+      </div>
+    );
+  }
 
+  // ---- project card grid ----
+  if (!openProject) {
+    if (projects.length === 0) {
+      return (
+        <Card title="Project Activity">
+          <p className="text-sm text-gray-500">
+            You&rsquo;re not a contributing member of any project, so there&rsquo;s no activity to show.
+          </p>
+        </Card>
+      );
+    }
+    return (
+      <div className="space-y-4">
+        <p className="text-sm text-gray-400">Pick a project, then a team, to see that team&rsquo;s document activity.</p>
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+          {projects.map((project) => (
+            <button
+              key={project.project_id}
+              type="button"
+              onClick={() => enterProject(project)}
+              className="text-left rounded-lg border border-border bg-background p-4 hover:border-primary/50 hover:bg-surface-hover transition-colors"
+            >
+              <div className="flex items-start justify-between gap-2">
+                <span className="font-semibold text-gray-100">{project.project_name}</span>
+                <Badge variant={project.admin_here ? 'active' : 'neutral'}>
+                  {project.admin_here ? 'Full access' : 'Your team'}
+                </Badge>
+              </div>
+              <p className="text-xs text-gray-500 mt-2">
+                {project.teams.length} team{project.teams.length === 1 ? '' : 's'} you can view
+              </p>
+            </button>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  // ---- one project: team dropdown + flat activity list ----
+  const teamOptions = openProject.teams.map((t) => ({ label: t.name, value: t.team_id }));
   return (
-    <div className="space-y-6">
-      <Card title="Project activity and ownership" description="See who changed important project data, when it happened, and which stage or document was affected.">
-        <Dropdown label="Project" options={projectOptions} value={projectId} onChange={load} placeholder="Select project" />
+    <div className="space-y-5">
+      <button
+        type="button"
+        onClick={() => { setOpenProject(null); setTeamId(''); setFeed(null); }}
+        className="text-gray-400 hover:text-gray-200 transition-colors flex items-center gap-1 text-sm"
+      >
+        <ArrowLeft size={15} /> All projects
+      </button>
+
+      <Card
+        title={openProject.project_name}
+        description={openProject.admin_here
+          ? 'You administer this project — you can view activity for any team.'
+          : 'You can view activity for the team(s) you contribute to or lead.'}
+      >
+        <Dropdown
+          label="Team"
+          options={teamOptions}
+          value={teamId}
+          onChange={pickTeam}
+          placeholder="Select a team"
+        />
       </Card>
-      {error && <p className="text-sm text-red-400">{error}</p>}
-      {loading && <p className="text-sm text-gray-400">Loading project activity…</p>}
-      {data && (
-        <>
-          <Card title={data.project.project_name} description={`${data.documents.length} document(s) currently recorded in this project.`}>
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-              <div><p className="text-xs text-gray-500">Project ID</p><p className="text-sm text-gray-200 mt-1">{data.project.project_id}</p></div>
-              <div><p className="text-xs text-gray-500">Documents</p><p className="text-sm text-gray-200 mt-1">{data.documents.length}</p></div>
-              <div><p className="text-xs text-gray-500">Stages represented</p><p className="text-sm text-gray-200 mt-1">{new Set(data.documents.map((doc) => doc.stage)).size}</p></div>
-              <div><p className="text-xs text-gray-500">Activity events</p><p className="text-sm text-gray-200 mt-1">{data.activity.length}</p></div>
-            </div>
-          </Card>
-          <Card title="Chronological activity" description="Actor, action, timestamp, stage, and affected resource.">
-            <div className="space-y-3">
-              {data.activity.map((event) => (
-                <div key={event.log_id} className="rounded-lg border border-border bg-background p-3">
-                  <div className="flex flex-wrap items-center justify-between gap-2">
-                    <div className="flex items-center gap-2">
-                      <Badge variant="active">{event.action}</Badge>
-                      <span className="text-sm text-gray-200">{event.actor_name}</span>
-                    </div>
-                    <span className="text-xs text-gray-500">{new Date(event.timestamp).toLocaleString()}</span>
+
+      {feedError && <p className="text-sm text-red-400">{feedError}</p>}
+      {feedLoading && <p className="text-sm text-gray-400">Loading activity…</p>}
+
+      {feed && (
+        <Card
+          title="Team activity"
+          description="Newest first. Each entry shows its stage and current workflow outcome. Activity for confidential documents only appears if you have clearance for them."
+        >
+          <div className="space-y-3">
+            {feed.map((event) => (
+              <div key={event.log_id} className="rounded-lg border border-border bg-background p-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <Badge variant="active">{event.action.replace(/_/g, ' ').toLowerCase()}</Badge>
+                    <span className="text-sm text-gray-200">{event.actor_name}</span>
+                    {event.status && <Badge variant={statusVariant(event.status)}>{event.status.replace(/_/g, ' ')}</Badge>}
                   </div>
-                  <p className="text-xs text-gray-400 mt-2">
-                    {event.resource_type}{event.filename ? ` · ${event.filename}` : ''}
-                    {event.document_stage ? ` · Stage: ${event.document_stage}` : ''}
-                  </p>
-                  {event.details && <p className="text-xs text-gray-500 mt-1">{event.details}</p>}
+                  <span className="text-xs text-gray-500">{new Date(event.timestamp).toLocaleString()}</span>
                 </div>
-              ))}
-              {data.activity.length === 0 && <p className="text-sm text-gray-500">No project activity has been recorded yet.</p>}
-            </div>
-          </Card>
-        </>
+                <p className="text-xs text-gray-400 mt-2">
+                  <span className="text-gray-300">{event.filename}</span>
+                  {' · '}Stage: {event.stage}
+                  {' · '}{event.sensitivity_level}
+                </p>
+                {event.rejection_reason && (
+                  <p className="text-xs text-red-400 mt-1">Rejection reason: {event.rejection_reason}</p>
+                )}
+                {event.details && <p className="text-xs text-gray-500 mt-1">{event.details}</p>}
+              </div>
+            ))}
+            {feed.length === 0 && (
+              <p className="text-sm text-gray-500">No activity recorded for this team yet.</p>
+            )}
+          </div>
+        </Card>
       )}
     </div>
   );
@@ -915,15 +1028,23 @@ const ApprovalsTab = ({ projects }) => {
   );
 };
 
+// Audit Log — flat list (format unchanged), restricted to org_admin /
+// project_admin / team_lead. What's shown is scoped by role on the backend
+// (org_admin: tenant-wide; project_admin: their project(s); team_lead: their
+// team(s)). Only account/permission-management actions are captured — no LOGIN.
 const AuditTab = () => {
   const [entries, setEntries] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+  const [denied, setDenied] = useState(false);
 
   useEffect(() => {
     adminApi.auditLog(200)
       .then(setEntries)
-      .catch((err) => setError(err.message || 'Could not load the audit log.'))
+      .catch((err) => {
+        if (err.status === 403) setDenied(true);
+        else setError(err.message || 'Could not load the audit log.');
+      })
       .finally(() => setLoading(false));
   }, []);
 
@@ -932,6 +1053,17 @@ const AuditTab = () => {
       <div className="flex justify-center py-8">
         <div className="w-6 h-6 border-4 border-primary/30 border-t-primary rounded-full animate-spin" />
       </div>
+    );
+  }
+
+  if (denied) {
+    return (
+      <Card title="Access denied">
+        <p className="text-sm text-gray-400">
+          The audit log is available to organization admins, project admins and team leads only.
+          Your role doesn&rsquo;t include audit-log access.
+        </p>
+      </Card>
     );
   }
 
@@ -946,6 +1078,7 @@ const AuditTab = () => {
             <th className="py-2 pr-4">Action</th>
             <th className="py-2 pr-4">Resource</th>
             <th className="py-2 pr-4">Details</th>
+            <th className="py-2 pr-4">Outcome</th>
           </tr>
         </thead>
         <tbody className="divide-y divide-border/50">
@@ -955,11 +1088,14 @@ const AuditTab = () => {
               <td className="py-2 pr-4"><Badge variant="neutral">{e.action}</Badge></td>
               <td className="py-2 pr-4">{e.resource_type}{e.resource_id ? ` · ${e.resource_id}` : ''}</td>
               <td className="py-2 pr-4 text-gray-400">{e.details || '—'}</td>
+              <td className="py-2 pr-4">
+                {e.status ? <Badge variant={statusVariant(e.status)}>{e.status}</Badge> : <span className="text-gray-600">—</span>}
+              </td>
             </tr>
           ))}
         </tbody>
       </table>
-      {entries.length === 0 && <p className="text-gray-500 text-sm py-8 text-center">No audit events yet.</p>}
+      {entries.length === 0 && <p className="text-gray-500 text-sm py-8 text-center">No audit events in your scope yet.</p>}
     </div>
   );
 };

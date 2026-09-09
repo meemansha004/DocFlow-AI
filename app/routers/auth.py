@@ -139,9 +139,8 @@ def login(body: LoginRequest, db: Session = Depends(get_db)):
     user = db.execute(select(User).where(User.email == email)).scalar_one_or_none()
     if user is None or not user.password_hash or not verify_password(body.password, user.password_hash):
         raise HTTPException(status_code=401, detail="Invalid email or password")
-    record_audit(db, actor_id=user.user_id, action="LOGIN", resource_type="user",
-                 resource_id=user.user_id, details={"method": "password"})
-    db.commit()
+    # LOGIN events are deliberately not audited (finalized Audit Log design —
+    # the log carries account/permission-management actions only).
     return TokenResponse(access_token=create_session_token(str(user.user_id)))
 
 
@@ -179,8 +178,7 @@ def google_callback(code: str, state: str, request: Request, db: Session = Depen
         db.flush()
         record_audit(db, actor_id=user.user_id, action="SIGNUP", resource_type="user",
                      resource_id=user.user_id, details={"method": "google"})
-    record_audit(db, actor_id=user.user_id, action="LOGIN", resource_type="user",
-                 resource_id=user.user_id, details={"method": "google"})
+    # LOGIN events are deliberately not audited (see POST /auth/login).
     db.commit()
     db.refresh(user)
 

@@ -35,7 +35,7 @@ from app.models.project import Project
 from app.models.team import ProjectAdmin, Team, TeamRole, UserTeamMembership
 from app.models.user import User
 from app.services.access_control import has_permission
-from app.services.audit import list_audit_for_tenant, record_audit
+from app.services.audit import AuditAccessError, list_audit_log, record_audit
 from app.services.auth import ResolvedIdentity
 
 router = APIRouter(prefix="/admin", tags=["admin"])
@@ -501,10 +501,16 @@ def assign_project_access(
 
 @router.get("/audit-log")
 def get_audit_log(
-    limit: int = 100,
+    limit: int = 200,
     identity: ResolvedIdentity = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    if not identity.is_org_admin:
-        raise HTTPException(status_code=403, detail="Only organization admins can view the audit log")
-    return list_audit_for_tenant(db, identity.tenant_id, limit=min(max(limit, 1), 1000))
+    """
+    Account / permission-management audit trail, scoped by role:
+      org_admin -> tenant-wide; project_admin -> their project(s);
+      team_lead -> their team(s). contributor / viewer get a 403.
+    """
+    try:
+        return list_audit_log(db, identity, limit=min(max(limit, 1), 1000))
+    except AuditAccessError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc

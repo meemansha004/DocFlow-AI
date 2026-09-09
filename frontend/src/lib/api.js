@@ -158,7 +158,18 @@ export const projectsApi = {
     const docs = await projectsApi.documents(projectId);
     return docs.filter((d) => d.workflow_state === 'pending_review');
   },
-  activity: () => notConnected('project activity'),
+};
+
+// ---------- Project Activity (real backend) ----------
+// Finalized design: project cards -> single team -> flat, sensitivity-filtered
+// activity feed for that team. See app/services/activity.py.
+export const activityApi = {
+  // -> [{ project_id, project_name, admin_here, teams: [{ team_id, name }] }]
+  projects: () => request('/activity/projects'),
+  // -> [{ log_id, actor_name, action, filename, stage, sensitivity_level,
+  //       status, current_state, rejection_reason, details, timestamp }]
+  feed: (projectId, teamId) =>
+    request(`/activity?project_id=${encodeURIComponent(projectId)}&team_id=${encodeURIComponent(teamId)}`),
 };
 
 // ---------- Documents ----------

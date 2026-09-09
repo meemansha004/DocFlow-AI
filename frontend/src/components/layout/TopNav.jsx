@@ -14,6 +14,11 @@ const TopNav = ({ onTutorialOpen }) => {
   const [unreadCount, setUnreadCount] = useState(0);
   const menuRef = useRef(null);
   const notificationRef = useRef(null);
+  // The Admin area now hosts role-scoped tabs (Audit Log, Project Activity) that
+  // are open to project admins, team leads and contributors — not just org
+  // admins. Show the entry point to anyone with a non-viewer role.
+  const canOpenAdmin = Boolean(user?.is_org_admin)
+    || Object.values(user?.project_roles || {}).some((r) => ['contributor', 'team_lead', 'project_admin'].includes(r));
   const notificationDismissedKey = `docflow_notifications_dismissed_${user?.user_id || user?.username || 'guest'}`;
 
   useEffect(() => {
@@ -182,7 +187,7 @@ const TopNav = ({ onTutorialOpen }) => {
             </div>
           )}
         </div>
-        {user?.is_org_admin && (
+        {canOpenAdmin && (
           <Link
             to="/admin"
             className="p-2 text-gray-500 hover:text-primary transition-colors rounded-full hover:bg-surface-hover"
