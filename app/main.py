@@ -9,6 +9,7 @@ from app.routers import (
     auth,
     documents,
     projects,
+    stages,
     workflow,
     workspace,
 )
@@ -35,6 +36,7 @@ app.include_router(documents.router)
 app.include_router(workflow.router)
 app.include_router(workspace.router)
 app.include_router(projects.router)
+app.include_router(stages.router)
 app.include_router(admin.router)
 app.include_router(access_requests.router)
 app.include_router(activity.router)

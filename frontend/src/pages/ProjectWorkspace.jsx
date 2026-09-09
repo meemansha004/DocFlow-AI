@@ -31,8 +31,8 @@ const ProjectWorkspace = () => {
   const [reqNotice, setReqNotice] = useState('');
   const [reqError, setReqError] = useState('');
 
-  const load = useCallback(async () => {
-    setLoading(true);
+  const load = useCallback(async ({ silent = false } = {}) => {
+    if (!silent) setLoading(true);
     setError('');
     try {
       const [projects, docs, ws, mine] = await Promise.all([
@@ -101,6 +101,7 @@ const ProjectWorkspace = () => {
   // the document's *specific* team and returns a clear 403 otherwise).
   const canReview = ['org_admin', 'project_admin', 'team_lead'].includes(role);
   const canManageAccess = ['org_admin', 'project_admin', 'team_lead'].includes(role);
+  const canManageStages = ['org_admin', 'project_admin'].includes(role);
   const pendingCount = documents.filter((document) => document.workflow_state === 'pending_review').length;
   const approvedCount = documents.filter((document) => document.workflow_state === 'approved').length;
   const memberNames = project?.members?.map((member) => member.name || member.username).filter(Boolean) || [];
@@ -134,9 +135,9 @@ const ProjectWorkspace = () => {
   }
 
   return (
-    <div className="flex-1 flex flex-col">
-      {/* Workspace Header */}
-      <div className="h-14 border-b border-border bg-background px-6 flex items-center gap-4 shrink-0">
+    <div className="flex flex-col h-[calc(100vh-3.5rem)] overflow-hidden">
+      {/* Workspace Header — stays fixed; the columns below scroll independently */}
+      <div className="h-14 border-b border-border bg-background px-6 flex items-center gap-4 shrink-0 overflow-x-auto">
         <Link to="/" className="text-gray-400 hover:text-gray-200 transition-colors flex items-center gap-1 text-sm">
           <ArrowLeft size={16} />
           All Projects
@@ -205,15 +206,25 @@ const ProjectWorkspace = () => {
         </Button>
       </div>
 
-      {/* 3-Column Layout */}
-      <div className="flex-1 flex flex-col lg:flex-row">
-        <div className="w-full lg:w-[30%] shrink-0">
-          <SourcePanel documents={documents} canReview={canReview} canDelete={user?.is_org_admin} onChanged={load} />
+      {/* 3-Column Layout — each column scrolls inside its own fixed-height pane.
+          Below lg the whole row scrolls as one stacked column. */}
+      <div className="flex-1 min-h-0 flex flex-col lg:flex-row overflow-y-auto lg:overflow-hidden">
+        <div className="w-full lg:w-[30%] shrink-0 lg:h-full lg:min-h-0 lg:overflow-y-auto">
+          <SourcePanel
+            documents={documents}
+            canReview={canReview}
+            canDelete={user?.is_org_admin}
+            onChanged={load}
+            projectId={projectId}
+            stages={wsProject?.stages || []}
+            canManageStages={canManageStages}
+            onStagesChanged={() => load({ silent: true })}
+          />
         </div>
-        <div className="w-full lg:w-[40%] shrink-0 border-t border-border lg:border-t-0">
+        <div className="w-full lg:w-[40%] shrink-0 lg:h-full lg:min-h-0 lg:overflow-y-auto border-t border-border lg:border-t-0">
           <ChatPanel projectId={projectId} />
         </div>
-        <div className="w-full lg:w-[30%] shrink-0 border-t border-border lg:border-t-0">
+        <div className="w-full lg:w-[30%] shrink-0 lg:h-full lg:min-h-0 lg:overflow-y-auto border-t border-border lg:border-t-0">
           <StudioPanel projectId={projectId} onAnalyzeGaps={handleAnalyzeGaps} />
         </div>
       </div>

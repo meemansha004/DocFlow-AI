@@ -172,6 +172,36 @@ export const activityApi = {
     request(`/activity?project_id=${encodeURIComponent(projectId)}&team_id=${encodeURIComponent(teamId)}`),
 };
 
+// ---------- Stages (real backend) ----------
+// Create / edit / soft-delete project stages. Mutations clear the workspace
+// cache so ProjectWorkspace picks up the new stage list on reload.
+export const stagesApi = {
+  list: (projectId) => request(`/projects/${encodeURIComponent(projectId)}/stages`),
+  create: async (projectId, body) => {
+    const r = await request(`/projects/${encodeURIComponent(projectId)}/stages`, { method: 'POST', body });
+    clearWorkspaceCache();
+    return r;
+  },
+  // body: { name?, order_index?, requires_approval? }
+  update: async (projectId, stageId, body) => {
+    const r = await request(
+      `/projects/${encodeURIComponent(projectId)}/stages/${encodeURIComponent(stageId)}`,
+      { method: 'PATCH', body },
+    );
+    clearWorkspaceCache();
+    return r;
+  },
+  remove: async (projectId, stageId, reassignTo) => {
+    const q = reassignTo ? `?reassign_to=${encodeURIComponent(reassignTo)}` : '';
+    const r = await request(
+      `/projects/${encodeURIComponent(projectId)}/stages/${encodeURIComponent(stageId)}${q}`,
+      { method: 'DELETE' },
+    );
+    clearWorkspaceCache();
+    return r;
+  },
+};
+
 // ---------- Documents ----------
 export const documentsApi = {
   list: (projectId) => projectsApi.documents(projectId),
