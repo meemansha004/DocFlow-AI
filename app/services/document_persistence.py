@@ -1,5 +1,7 @@
 """
-Document persistence — real DB writes, gated by has_permission().
+Document persistence — real DB writes, gated by has_permission() AND
+has_stage_access() (Phase A Part 3: a team also needs a team_stage_access
+grant for the target stage, org_admin/project_admin bypass both).
 
 create_document() takes the acting identity (user_id / team_id / project_id /
 role) as EXPLICIT parameters. It no longer reaches into session_context —
@@ -27,7 +29,7 @@ from app.models.document import (
 from app.models.stage import Stage
 from app.models.user import User
 from app.models.workflow import WorkflowState, WorkflowStatus
-from app.services.access_control import has_permission, resolve_sensitivity
+from app.services.access_control import has_permission, has_stage_access, resolve_sensitivity
 from app.services.audit import record_audit
 
 
@@ -93,6 +95,15 @@ def create_document(
     if stage is None or stage.project_id != project_id or stage.deleted_at is not None:
         raise StageNotFoundError(
             f"Stage {stage_id} does not exist in this project (or has been deleted)."
+        )
+
+    # THIRD check (Phase A Part 3), alongside the role/team-project check
+    # above: does the acting team have a team_stage_access grant for this
+    # stage? org_admin/project_admin bypass entirely (has_stage_access()
+    # applies the same bypass has_permission() does above).
+    if not has_stage_access(db, user_id, team_id, stage_id, project_id):
+        raise PermissionDeniedError(
+            f"Team does not have access to upload to the '{stage.name}' stage."
         )
 
     final_sensitivity = resolve_sensitivity(sensitivity, role)

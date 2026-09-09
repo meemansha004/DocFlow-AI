@@ -38,5 +38,16 @@ FRONTEND_URL: str = os.getenv("FRONTEND_URL", "http://localhost:5173")
 # No sensible default in a multi-tenant system — must be set for signup to work.
 DEFAULT_SIGNUP_TENANT_ID: str = os.getenv("DEFAULT_SIGNUP_TENANT_ID", "")
 
+# --- Phase A: RAG / vector store (Qdrant) -------------------------------------
+# QDRANT_URL blank  -> embedded local mode (on-disk at QDRANT_LOCAL_PATH), no
+#                      server, no key. Fine for dev; supports named + sparse
+#                      vectors and payload indexes.
+# QDRANT_URL set    -> connect to that Qdrant (local Docker on :6333, or a
+#                      Qdrant Cloud cluster URL). QDRANT_API_KEY needed for
+#                      Qdrant Cloud, not for a bare local server.
+QDRANT_URL: str = os.getenv("QDRANT_URL", "")
+QDRANT_API_KEY: str = os.getenv("QDRANT_API_KEY", "")
+QDRANT_LOCAL_PATH: str = os.getenv("QDRANT_LOCAL_PATH", "qdrant_storage")
+
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL not set — check your .env file")

@@ -136,6 +136,11 @@ check(up2.json().get("workflow_state") is None and wf2 is None,
 h("4)  delete a stage that still owns documents -> blocked; then reassign")
 r = c.post(f"/projects/{PID}/stages", headers=tok("bob@test.com"), json={"name": NAME_TEMP})
 temp_id = r.json()["stage_id"]
+# Phase A Part 3: a brand-new stage has no team_stage_access grants yet —
+# bob (project_admin) grants Engineering access before erin can upload here,
+# same as a real admin would after creating a stage.
+c.put(f"/projects/{PID}/stages/{temp_id}/team-access", headers=tok("bob@test.com"),
+      json={"team_ids": [str(ENG.team_id)]})
 c.post("/documents/upload", headers=tok("erin@test.com"), json={
     "document_type": "Doc In Temp", "stage_id": temp_id, "content": "# x",
     "team_id": str(ENG.team_id), "sensitivity_level": "internal",

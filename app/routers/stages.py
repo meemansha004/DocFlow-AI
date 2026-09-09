@@ -30,7 +30,9 @@ from app.api.dependencies import get_current_user
 from app.database import get_db
 from app.models.document import Document
 from app.models.project import Project
-from app.models.stage import Stage, StageReference
+from app.models.stage import Stage, StageReference, TeamStageAccess
+from app.models.team import Team
+from app.services.access_control import get_accessible_stages_for_user
 from app.services.audit import record_audit
 from app.services.auth import ResolvedIdentity
 
@@ -56,6 +58,11 @@ class SetStageReferencesRequest(BaseModel):
     references: list[uuid.UUID] = Field(default_factory=list)
 
 
+class SetTeamAccessRequest(BaseModel):
+    # The FULL desired set of teams granted access to this stage (replace, not append).
+    team_ids: list[uuid.UUID] = Field(default_factory=list)
+
+
 class StageOut(BaseModel):
     stage_id: str
     project_id: str
@@ -65,6 +72,8 @@ class StageOut(BaseModel):
     document_count: int
     # Stage IDs this stage references (one-way, same project). Drives RAG scope.
     references: list[str] = Field(default_factory=list)
+    # Team IDs granted access to this stage (upload + visibility gate).
+    team_access: list[str] = Field(default_factory=list)
 
 
 # --- helpers ---------------------------------------------------------------
@@ -127,7 +136,24 @@ def _refs_by_stage(db: Session, stage_ids: list[uuid.UUID]) -> dict[uuid.UUID, l
     return out
 
 
-def _serialize(stage: Stage, doc_count: int, refs: list[uuid.UUID] | None = None) -> StageOut:
+def _team_access_by_stage(db: Session, stage_ids: list[uuid.UUID]) -> dict[uuid.UUID, list[uuid.UUID]]:
+    """{stage_id: [team_id with access, ...]} for the given stages."""
+    out: dict[uuid.UUID, list[uuid.UUID]] = {sid: [] for sid in stage_ids}
+    if not stage_ids:
+        return out
+    for r in db.execute(
+        select(TeamStageAccess).where(TeamStageAccess.stage_id.in_(stage_ids))
+    ).scalars():
+        out.setdefault(r.stage_id, []).append(r.team_id)
+    return out
+
+
+def _serialize(
+    stage: Stage,
+    doc_count: int,
+    refs: list[uuid.UUID] | None = None,
+    team_access: list[uuid.UUID] | None = None,
+) -> StageOut:
     return StageOut(
         stage_id=str(stage.stage_id),
         project_id=str(stage.project_id),
@@ -136,6 +162,7 @@ def _serialize(stage: Stage, doc_count: int, refs: list[uuid.UUID] | None = None
         requires_approval=stage.requires_approval,
         document_count=doc_count,
         references=[str(x) for x in (refs or [])],
+        team_access=[str(x) for x in (team_access or [])],
     )
 
 
@@ -150,11 +177,19 @@ def list_stages(
     _load_project(db, identity, project_id)
     if not _can_see_project(db, identity, project_id):
         raise HTTPException(status_code=403, detail="You do not have access to this project")
+
+    # ENFORCEMENT POINT B: a regular user only sees stages accessible via ANY
+    # of their team memberships in this project (team_stage_access union).
+    # org_admin/project_admin bypass — get_accessible_stages_for_user()
+    # returns every active stage for them, unfiltered.
+    accessible_ids = set(get_accessible_stages_for_user(db, identity.user_id, project_id))
+
     counts = _doc_counts(db, project_id)
-    stages = _active_stages(db, project_id)
+    stages = [s for s in _active_stages(db, project_id) if s.stage_id in accessible_ids]
     refs = _refs_by_stage(db, [s.stage_id for s in stages])
+    team_access = _team_access_by_stage(db, [s.stage_id for s in stages])
     return [
-        _serialize(s, counts.get(s.stage_id, 0), refs.get(s.stage_id, []))
+        _serialize(s, counts.get(s.stage_id, 0), refs.get(s.stage_id, []), team_access.get(s.stage_id, []))
         for s in stages
     ]
 
@@ -241,7 +276,8 @@ def update_stage(
     if not changed:
         counts = _doc_counts(db, project_id)
         return _serialize(stage, counts.get(stage_id, 0),
-                          _refs_by_stage(db, [stage_id])[stage_id])
+                          _refs_by_stage(db, [stage_id])[stage_id],
+                          _team_access_by_stage(db, [stage_id])[stage_id])
 
     record_audit(
         db, actor_id=identity.user_id, action="UPDATE_STAGE", resource_type="stage",
@@ -253,7 +289,8 @@ def update_stage(
     db.refresh(stage)
     counts = _doc_counts(db, project_id)
     return _serialize(stage, counts.get(stage_id, 0),
-                      _refs_by_stage(db, [stage_id])[stage_id])
+                      _refs_by_stage(db, [stage_id])[stage_id],
+                      _team_access_by_stage(db, [stage_id])[stage_id])
 
 
 @router.delete("/{project_id}/stages/{stage_id}")
@@ -314,6 +351,12 @@ def delete_stage(
         (StageReference.stage_id == stage_id)
         | (StageReference.references_stage_id == stage_id)
     ).delete(synchronize_session=False)
+
+    # Same for team_stage_access — a deleted stage shouldn't leave dangling
+    # access grants around.
+    db.query(TeamStageAccess).filter(TeamStageAccess.stage_id == stage_id).delete(
+        synchronize_session=False
+    )
 
     record_audit(
         db, actor_id=identity.user_id, action="DELETE_STAGE", resource_type="stage",
@@ -380,4 +423,62 @@ def set_stage_references(
         db.commit()
 
     counts = _doc_counts(db, project_id)
-    return _serialize(stage, counts.get(stage_id, 0), wanted)
+    return _serialize(stage, counts.get(stage_id, 0), wanted,
+                      _team_access_by_stage(db, [stage_id])[stage_id])
+
+
+@router.put("/{project_id}/stages/{stage_id}/team-access", response_model=StageOut)
+def set_team_access(
+    project_id: uuid.UUID,
+    stage_id: uuid.UUID,
+    body: SetTeamAccessRequest,
+    identity: ResolvedIdentity = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Replace the full set of teams granted access to this stage. Every team_id
+    must be a team in the SAME project. Gates ENFORCEMENT POINT A (upload)
+    and ENFORCEMENT POINT B (stage visibility) for regular users — org_admin
+    / project_admin bypass both regardless of this list.
+    """
+    _load_project(db, identity, project_id)
+    _require_project_admin(identity, project_id)
+
+    stage = db.get(Stage, stage_id)
+    if stage is None or stage.project_id != project_id or stage.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="Stage not found")
+
+    project_team_ids = {
+        t.team_id for t in db.execute(
+            select(Team).where(Team.project_id == project_id)
+        ).scalars()
+    }
+    wanted: list[uuid.UUID] = []
+    for team_id in body.team_ids:
+        if team_id in wanted:
+            continue  # dedupe silently
+        if team_id not in project_team_ids:
+            raise HTTPException(
+                status_code=422,
+                detail="A granted team must be a team in this project",
+            )
+        wanted.append(team_id)
+
+    current = set(_team_access_by_stage(db, [stage_id])[stage_id])
+    if current != set(wanted):
+        db.query(TeamStageAccess).filter(TeamStageAccess.stage_id == stage_id).delete(
+            synchronize_session=False
+        )
+        for team_id in wanted:
+            db.add(TeamStageAccess(team_id=team_id, stage_id=stage_id))
+        record_audit(
+            db, actor_id=identity.user_id, action="UPDATE_STAGE_TEAM_ACCESS",
+            resource_type="stage", resource_id=stage_id,
+            details={"project_id": str(project_id),
+                     "team_access": ",".join(str(x) for x in wanted) or "(none)"},
+        )
+        db.commit()
+
+    counts = _doc_counts(db, project_id)
+    return _serialize(stage, counts.get(stage_id, 0),
+                      _refs_by_stage(db, [stage_id])[stage_id], wanted)

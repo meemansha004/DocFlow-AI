@@ -20,8 +20,9 @@ from sqlalchemy.orm import Session
 from app.api.dependencies import get_current_user
 from app.database import get_db
 from app.models.project import Project
-from app.models.stage import Stage, StageReference
+from app.models.stage import Stage, StageReference, TeamStageAccess
 from app.models.team import Team
+from app.services.access_control import get_accessible_stages_for_user
 from app.services.auth import ResolvedIdentity
 
 router = APIRouter(prefix="/workspace", tags=["workspace"])
@@ -39,6 +40,7 @@ class StageOut(BaseModel):
     order_index: int
     requires_approval: bool
     references: list[str] = []  # stage_ids this stage references (one-way)
+    team_access: list[str] = []  # team_ids granted access to this stage
 
 
 class ProjectOut(BaseModel):
@@ -102,11 +104,19 @@ def get_workspace(
                 for m in memberships_by_project.get(pid, [])
             ]
 
-        stages = db.execute(
-            select(Stage)
-            .where(Stage.project_id == pid, Stage.deleted_at.is_(None))
-            .order_by(Stage.order_index)
-        ).scalars().all()
+        # ENFORCEMENT POINT B: a regular user only sees stages accessible via
+        # ANY of their team memberships in this project (team_stage_access
+        # union). org_admin/project_admin bypass — get_accessible_stages_for_user()
+        # returns every active stage for them, unfiltered.
+        accessible_ids = set(get_accessible_stages_for_user(db, identity.user_id, pid))
+        stages = [
+            s for s in db.execute(
+                select(Stage)
+                .where(Stage.project_id == pid, Stage.deleted_at.is_(None))
+                .order_by(Stage.order_index)
+            ).scalars().all()
+            if s.stage_id in accessible_ids
+        ]
         refs_by_stage: dict[uuid.UUID, list[str]] = {}
         for sr in db.execute(
             select(StageReference).where(
@@ -114,6 +124,13 @@ def get_workspace(
             )
         ).scalars():
             refs_by_stage.setdefault(sr.stage_id, []).append(str(sr.references_stage_id))
+        team_access_by_stage: dict[uuid.UUID, list[str]] = {}
+        for ta in db.execute(
+            select(TeamStageAccess).where(
+                TeamStageAccess.stage_id.in_([s.stage_id for s in stages])
+            )
+        ).scalars():
+            team_access_by_stage.setdefault(ta.stage_id, []).append(str(ta.team_id))
 
         projects_out.append(ProjectOut(
             project_id=str(pid),
@@ -126,6 +143,7 @@ def get_workspace(
                     order_index=s.order_index,
                     requires_approval=s.requires_approval,
                     references=refs_by_stage.get(s.stage_id, []),
+                    team_access=team_access_by_stage.get(s.stage_id, []),
                 )
                 for s in stages
             ],

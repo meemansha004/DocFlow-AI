@@ -17,6 +17,9 @@ __pycache__/
 drafts/
 draft generation/
 
+# Qdrant embedded local-mode storage (on-disk vector DB, not source code)
+qdrant_storage/
+
 # IDE
 .vscode/
 .idea/

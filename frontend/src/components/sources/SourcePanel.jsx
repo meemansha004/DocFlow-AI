@@ -1,5 +1,5 @@
 import React, { useMemo, useState } from 'react';
-import { Plus, Pencil, ArrowUp, ArrowDown, ShieldCheck, Trash2, Settings2, Link2 } from 'lucide-react';
+import { Plus, Pencil, ArrowUp, ArrowDown, ShieldCheck, Trash2, Settings2, Link2, Users } from 'lucide-react';
 import { STAGES } from '../../constants/stages';
 import StageSection from './StageSection';
 import KebabMenu from '../ui/KebabMenu';
@@ -16,6 +16,7 @@ const SourcePanel = ({
   onChanged,
   projectId,
   stages = [],
+  teams = [],
   canManageStages = false,
   onStagesChanged,
 }) => {
@@ -52,6 +53,7 @@ const SourcePanel = ({
   const [editName, setEditName] = useState('');
   const [reqApproval, setReqApproval] = useState(false);
   const [refIds, setRefIds] = useState([]); // stage_ids this stage references
+  const [teamAccessIds, setTeamAccessIds] = useState([]); // team_ids granted access to this stage
   const [reassignTo, setReassignTo] = useState('');
   const [stageBusy, setStageBusy] = useState(false);
   const [stageErr, setStageErr] = useState('');
@@ -66,6 +68,7 @@ const SourcePanel = ({
     setEditName(stage.name);
     setReqApproval(Boolean(stage.requires_approval));
     setRefIds(stage.references || []);
+    setTeamAccessIds(stage.team_access || []);
     setReassignTo('');
     setStageErr(''); setStageNotice('');
   };
@@ -95,6 +98,7 @@ const SourcePanel = ({
       setEditName(updated.name);
       setReqApproval(Boolean(updated.requires_approval));
       setRefIds(updated.references || []);
+      setTeamAccessIds(updated.team_access || []);
       if (successMsg) setStageNotice(successMsg);
       await refresh();
     } catch (err) {
@@ -119,6 +123,26 @@ const SourcePanel = ({
     } catch (err) {
       setRefIds(refIds); // roll back
       setStageErr(err.message || 'Could not update references.');
+    } finally {
+      setStageBusy(false);
+    }
+  };
+
+  const toggleTeamAccess = async (targetTeamId) => {
+    const next = teamAccessIds.includes(targetTeamId)
+      ? teamAccessIds.filter((id) => id !== targetTeamId)
+      : [...teamAccessIds, targetTeamId];
+    setTeamAccessIds(next); // optimistic
+    setStageBusy(true); setStageErr(''); setStageNotice('');
+    try {
+      const updated = await stagesApi.setTeamAccess(projectId, settingsStage.stage_id, next);
+      setSettingsStage(updated);
+      setTeamAccessIds(updated.team_access || []);
+      setStageNotice('Team access updated.');
+      await refresh();
+    } catch (err) {
+      setTeamAccessIds(teamAccessIds); // roll back
+      setStageErr(err.message || 'Could not update team access.');
     } finally {
       setStageBusy(false);
     }
@@ -348,6 +372,38 @@ const SourcePanel = ({
                         {s.name}
                       </label>
                     ))}
+                </div>
+              )}
+            </div>
+
+            {/* Team access */}
+            <div className="border-t border-border/60 pt-4">
+              <p className="text-sm font-medium text-gray-300 flex items-center gap-1.5">
+                <Users size={14} className="text-primary" /> Team access
+              </p>
+              <p className="text-xs text-gray-500 mt-0.5 mb-2">
+                Which teams can upload to and see &ldquo;{settingsStage.name}&rdquo;. Org/project
+                admins always have full access regardless of this list.
+              </p>
+              {teams.length === 0 ? (
+                <p className="text-xs text-gray-600">No teams in this project yet.</p>
+              ) : (
+                <div className="space-y-1">
+                  {teams.map((t) => (
+                    <label
+                      key={t.team_id}
+                      className="flex items-center gap-2 rounded-md px-2 py-1.5 text-sm text-gray-300 hover:bg-surface-hover cursor-pointer"
+                    >
+                      <input
+                        type="checkbox"
+                        className="accent-primary"
+                        disabled={stageBusy}
+                        checked={teamAccessIds.includes(t.team_id)}
+                        onChange={() => toggleTeamAccess(t.team_id)}
+                      />
+                      {t.name}
+                    </label>
+                  ))}
                 </div>
               )}
             </div>

@@ -217,6 +217,7 @@ const ProjectWorkspace = () => {
             onChanged={load}
             projectId={projectId}
             stages={wsProject?.stages || []}
+            teams={wsProject?.teams || []}
             canManageStages={canManageStages}
             onStagesChanged={() => load({ silent: true })}
           />

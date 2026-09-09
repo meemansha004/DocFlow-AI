@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session
 from app.models.user import User
 from app.models.team import UserTeamMembership, ProjectAdmin, TeamRole, AccessRequest, AccessRequestStatus
 from app.models.document import Document, DocumentTeamVisibility, SensitivityLevel
+from app.models.stage import Stage, TeamStageAccess
 
 
 # Rank order — higher index = more privileged. Used for cumulative comparison.
@@ -81,6 +82,63 @@ def has_permission(db: Session, user_id: UUID, action: str, team_id: UUID, proje
         raise ValueError(f"Unknown action: {action}")
 
     return _TEAM_ROLE_RANK[membership.role] >= _TEAM_ROLE_RANK[required_role]
+
+
+def has_stage_access(db: Session, user_id: UUID, team_id: UUID, stage_id: UUID, project_id: UUID) -> bool:
+    """
+    Phase A Part 3: does `team_id` have a team_stage_access grant for
+    `stage_id`? org_admin/project_admin BYPASS entirely — same bypass
+    pattern as has_permission(). No grant row == no access, full stop
+    (there is no rank/hierarchy here; access is per (team, stage), not
+    cumulative).
+
+    Used as a THIRD gate in create_document(), alongside (not replacing)
+    has_permission()'s role/team-project check.
+    """
+    if _is_org_admin(db, user_id):
+        return True
+    if _is_project_admin(db, user_id, project_id):
+        return True
+
+    stmt = select(TeamStageAccess).where(
+        TeamStageAccess.team_id == team_id, TeamStageAccess.stage_id == stage_id
+    )
+    return db.execute(stmt).scalar_one_or_none() is not None
+
+
+def get_accessible_stages_for_user(db: Session, user_id: UUID, project_id: UUID) -> list[UUID]:
+    """
+    The set of stage_ids `user_id` may see/upload to within `project_id`:
+    the UNION of stages accessible via ANY of their team memberships in this
+    project, via team_stage_access. org_admin/project_admin bypass — every
+    active stage in the project, unfiltered.
+
+    Used to filter stage visibility (Sources panel, stage dropdowns) for
+    regular users, and is the resolver Phase C retrieval will consume to
+    scope RAG to what a user is allowed to see.
+    """
+    if _is_org_admin(db, user_id) or _is_project_admin(db, user_id, project_id):
+        return list(db.execute(
+            select(Stage.stage_id).where(
+                Stage.project_id == project_id, Stage.deleted_at.is_(None)
+            )
+        ).scalars())
+
+    team_ids = list(db.execute(
+        select(UserTeamMembership.team_id).where(
+            UserTeamMembership.user_id == user_id,
+            UserTeamMembership.project_id == project_id,
+        )
+    ).scalars())
+    if not team_ids:
+        return []
+
+    return list(db.execute(
+        select(TeamStageAccess.stage_id)
+        .join(Stage, Stage.stage_id == TeamStageAccess.stage_id)
+        .where(TeamStageAccess.team_id.in_(team_ids), Stage.deleted_at.is_(None))
+        .distinct()
+    ).scalars())
 
 
 def _has_active_confidential_grant(db: Session, user_id: UUID, team_id: UUID) -> bool:

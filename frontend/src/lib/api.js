@@ -209,6 +209,15 @@ export const stagesApi = {
     clearWorkspaceCache();
     return r;
   },
+  // Replace the full set of teams granted access to this stage (team_ids, same project).
+  setTeamAccess: async (projectId, stageId, teamIds) => {
+    const r = await request(
+      `/projects/${encodeURIComponent(projectId)}/stages/${encodeURIComponent(stageId)}/team-access`,
+      { method: 'PUT', body: { team_ids: teamIds } },
+    );
+    clearWorkspaceCache();
+    return r;
+  },
 };
 
 // ---------- Documents ----------

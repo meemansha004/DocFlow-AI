@@ -87,3 +87,35 @@ class StageReference(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )
+
+
+class TeamStageAccess(Base):
+    """
+    Grants a team access to a stage: uploading documents as this team to this
+    stage, and seeing this stage at all, requires a row here. No row for a
+    (team_id, stage_id) pair == that team has no access to that stage.
+
+    org_admin / project_admin BYPASS this check entirely (same bypass pattern
+    as has_permission() elsewhere) — see
+    app.services.access_control.has_stage_access() and
+    .get_accessible_stages_for_user(). An empty table for a project means no
+    regular user can upload to or see any stage in it until a project_admin
+    grants access.
+    """
+    __tablename__ = "team_stage_access"
+    __table_args__ = (
+        UniqueConstraint("team_id", "stage_id", name="uq_team_stage_access"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    team_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("teams.team_id"), nullable=False
+    )
+    stage_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("stages.stage_id"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
