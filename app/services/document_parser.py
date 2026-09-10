@@ -5,10 +5,6 @@ converts a documents raw bytes into clean markdown for scoring/reformation.
 TXT,MD -> direct decode (no parsing needed)
 """
 from io import BytesIO
-from docling.document_converter import DocumentConverter
-from docling.datamodel.base_models import DocumentStream
-
-converter = DocumentConverter()
 
 SUPPORTED_MIME_TYPES ={
     "application/pdf",
@@ -48,6 +44,10 @@ def parse_document_to_markdown(file_data: bytes, mime_type:str, filename:str) ->
             return file_data.decode("utf-8", errors="replace")
 
     try:
+        from docling.document_converter import DocumentConverter
+        from docling.datamodel.base_models import DocumentStream
+
+        converter = DocumentConverter()
         stream = DocumentStream(name=filename, stream=BytesIO(file_data))
         result = converter.convert(stream)
         return result.document.export_to_markdown()

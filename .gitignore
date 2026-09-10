@@ -1,6 +1,9 @@
 # Environment — NEVER commit secrets
 venv/
 .env
+*.env
+*.db
+*.sqlite
 frontend/.env
 frontend/.env.local
 
