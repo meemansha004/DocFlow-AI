@@ -5,12 +5,23 @@ has_permission() — the RBAC-style rank comparison, cumulative hierarchy,
 with org_admin/project_admin full bypass and the contributor confidential-
 access-grant exception.
 
-can_view_document() — combines has_permission with document-specific
-sensitivity + team-visibility checks (the ABAC layer wrapping the RBAC core).
+classify_document_visibility() — the full ABAC decision for a specific
+document (bypass, team visibility, sensitivity clearance), as a three-way
+outcome. can_view_document() is a bool-collapsing wrapper over it — the
+finer-grained outcome exists because Phase C retrieval needs to know WHY a
+document was excluded (not visible at all, vs. visible but sensitivity-
+blocked) to later offer a "request access" suggestion; nothing about the
+underlying logic changed by adding it.
 
 build_access_filter() — compound filter for listing/searching documents.
+
+has_any_project_access() — the coarse "does this user have ANY relationship
+to this project at all" gate (any team membership, or project/org admin),
+used to hard-reject a total stranger before any further, more expensive
+work (e.g. a Qdrant call in retrieval.py).
 """
 
+import enum
 from datetime import datetime, timezone
 from uuid import UUID
 
@@ -84,6 +95,35 @@ def has_permission(db: Session, user_id: UUID, action: str, team_id: UUID, proje
     return _TEAM_ROLE_RANK[membership.role] >= _TEAM_ROLE_RANK[required_role]
 
 
+def has_any_project_access(db: Session, user_id: UUID, project_id: UUID) -> bool:
+    """
+    Coarse gate: does `user_id` have ANY relationship to `project_id` at all
+    — org_admin, project_admin, or membership on at least one team in this
+    project? A False here means a total stranger to the project; callers
+    (e.g. retrieval.py) should hard-reject before doing anything more
+    expensive (a Qdrant call, a DB scan of documents, etc.).
+
+    Deliberately coarser than get_accessible_stages_for_user(): a legitimate
+    team member whose team simply hasn't been granted any team_stage_access
+    yet still passes this gate (they belong here, they just can't see
+    anything yet) — that's a different, non-error case from a stranger.
+    """
+    if _is_org_admin(db, user_id):
+        return True
+    if _is_project_admin(db, user_id, project_id):
+        return True
+    # A user can belong to several teams in the same project (e.g. erin:
+    # Engineering + Design) — this only needs to know AT LEAST ONE exists,
+    # so cap it at 1 row rather than scalar_one_or_none(), which raises on
+    # more than one.
+    return db.execute(
+        select(UserTeamMembership.id).where(
+            UserTeamMembership.user_id == user_id,
+            UserTeamMembership.project_id == project_id,
+        ).limit(1)
+    ).scalar_one_or_none() is not None
+
+
 def has_stage_access(db: Session, user_id: UUID, team_id: UUID, stage_id: UUID, project_id: UUID) -> bool:
     """
     Phase A Part 3: does `team_id` have a team_stage_access grant for
@@ -155,15 +195,35 @@ def _has_active_confidential_grant(db: Session, user_id: UUID, team_id: UUID) ->
     return True
 
 
-def can_view_document(db: Session, user_id: UUID, document: Document) -> bool:
+class DocumentVisibility(str, enum.Enum):
     """
-    Full ABAC check for viewing a specific document: bypass, team
-    visibility, and sensitivity clearance combined.
+    The three-way outcome of classify_document_visibility().
+      fully_allowed         -> the user may see this document, full stop.
+      blocked_by_sensitivity -> on a team the document IS visible to, but
+                                 this user's clearance doesn't reach its
+                                 sensitivity tier. Worth surfacing later
+                                 (e.g. "request access") — a real, known
+                                 document the user is specifically blocked
+                                 from, not an absence.
+      not_visible            -> not on any team this document is visible to
+                                 at all. No trace should be surfaced to the
+                                 user for this case.
+    """
+    fully_allowed = "fully_allowed"
+    blocked_by_sensitivity = "blocked_by_sensitivity"
+    not_visible = "not_visible"
+
+
+def classify_document_visibility(db: Session, user_id: UUID, document: Document) -> DocumentVisibility:
+    """
+    The full ABAC decision for viewing a specific document — bypass, team
+    visibility, and sensitivity clearance — as a three-way outcome rather
+    than can_view_document()'s bool. Same logic, same order, nothing added.
     """
     if _is_org_admin(db, user_id):
-        return True
+        return DocumentVisibility.fully_allowed
     if _is_project_admin(db, user_id, document.project_id):
-        return True
+        return DocumentVisibility.fully_allowed
 
     # Team visibility — document must be visible to a team the user belongs to
     visible_team_ids = {
@@ -179,20 +239,30 @@ def can_view_document(db: Session, user_id: UUID, document: Document) -> bool:
             break
 
     if membership is None:
-        return False  # not on any team this document is visible to
+        return DocumentVisibility.not_visible  # not on any team this document is visible to
 
     # Sensitivity clearance
     if document.sensitivity_level in (SensitivityLevel.public, SensitivityLevel.internal):
-        return True  # viewer+ can always see these
+        return DocumentVisibility.fully_allowed  # viewer+ can always see these
 
     # confidential tier
     if _TEAM_ROLE_RANK[membership.role] >= _TEAM_ROLE_RANK[TeamRole.team_lead]:
-        return True  # team_lead+ sees confidential automatically
+        return DocumentVisibility.fully_allowed  # team_lead+ sees confidential automatically
 
-    if membership.role == TeamRole.contributor:
-        return _has_active_confidential_grant(db, user_id, membership.team_id)
+    if membership.role == TeamRole.contributor and _has_active_confidential_grant(db, user_id, membership.team_id):
+        return DocumentVisibility.fully_allowed
 
-    return False  # viewer, no grant path
+    return DocumentVisibility.blocked_by_sensitivity  # viewer, or contributor with no grant
+
+
+def can_view_document(db: Session, user_id: UUID, document: Document) -> bool:
+    """
+    Full ABAC check for viewing a specific document: bypass, team
+    visibility, and sensitivity clearance combined. Thin bool wrapper over
+    classify_document_visibility() — see that function for the underlying
+    (and, for retrieval.py's purposes, more informative) three-way outcome.
+    """
+    return classify_document_visibility(db, user_id, document) == DocumentVisibility.fully_allowed
 
 
 def build_access_filter(db: Session, user_id: UUID, project_id: UUID):
