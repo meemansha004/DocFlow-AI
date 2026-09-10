@@ -2,10 +2,12 @@ import React, { useState, useRef, useEffect } from 'react';
 import { Bot, User, FileText, Plus, Trash2, MessageSquare, Menu, X, ClipboardCheck, ShieldAlert, ArrowLeft, Lock, Wrench } from 'lucide-react';
 import ChatInput from './ChatInput';
 import NotImplementedPanel from './NotImplementedPanel';
+import DraftDocumentCard from './DraftDocumentCard';
 import DocFileCard from '../ui/DocFileCard';
 import MarkdownViewer from '../ui/MarkdownViewer';
+import MarkdownMessage from '../ui/MarkdownMessage';
 import { agentsApi, chatApi, ragApi, queryApi, documentReviewApi } from '../../lib/api';
-import { draftTitle, renderMarkdown } from '../../lib/markdown';
+import { draftTitle } from '../../lib/markdown';
 import { saveBlob } from '../../lib/download';
 
 const SUGGESTIONS = [
@@ -203,6 +205,7 @@ const ChatPanel = ({ projectId, mode = 'rag', reviewSession = null, onReviewFina
           id: `${Date.now()}-bot`,
           sender: 'bot',
           text: res.reply || (res.finalized ? 'Draft finalized.' : ''),
+          markdown: true,
           drafted: !!res.drafted,
           finalized: !!res.finalized,
           scan: res.scan || null,
@@ -478,21 +481,27 @@ const ChatPanel = ({ projectId, mode = 'rag', reviewSession = null, onReviewFina
           </div>
         ) : (
           <div className="space-y-6">
-            {messages.map((msg) => (
-              <div key={msg.id} className={`flex gap-3 ${msg.sender === 'user' ? 'flex-row-reverse' : ''}`}>
-                <div className={`w-8 h-8 rounded-full flex items-center justify-center shrink-0 ${msg.sender === 'user' ? 'bg-primary/20 text-primary-light' : 'bg-surface border border-border text-gray-400'}`}>
-                  {msg.sender === 'user' ? <User size={16} /> : <Bot size={16} />}
-                </div>
-                <div className={`max-w-[85%] rounded-2xl px-4 py-2.5 text-sm ${msg.sender === 'user' ? 'bg-primary text-white rounded-tr-sm' : msg.isError ? 'bg-red-500/10 border border-red-500/30 text-red-300 rounded-tl-sm' : 'bg-surface border border-border text-gray-200 rounded-tl-sm'}`}>
-                  {msg.markdown && !msg.isError ? (
-                    <div
-                      className="markdown-body"
-                      // Content is Markdown from the agent; renderMarkdown escapes HTML first.
-                      dangerouslySetInnerHTML={{ __html: renderMarkdown(msg.text) }}
-                    />
-                  ) : (
-                    <p className="whitespace-pre-wrap">{msg.text}</p>
-                  )}
+            {messages.map((msg) => {
+              const isDraftDoc =
+                !msg.isError &&
+                msg.sender === 'bot' &&
+                (msg.drafted || (isDraft && msg.text && msg.text.includes('# ')));
+
+              return (
+                <div key={msg.id} className={`flex gap-3 ${msg.sender === 'user' ? 'flex-row-reverse' : ''}`}>
+                  <div className={`w-8 h-8 rounded-full flex items-center justify-center shrink-0 ${msg.sender === 'user' ? 'bg-primary/20 text-primary-light' : 'bg-surface border border-border text-gray-400'}`}>
+                    {msg.sender === 'user' ? <User size={16} /> : <Bot size={16} />}
+                  </div>
+                  <div className={`${isDraftDoc ? 'w-full max-w-3xl' : 'max-w-[85%]'} rounded-2xl px-4 py-2.5 text-sm ${msg.sender === 'user' ? 'bg-primary text-white rounded-tr-sm' : msg.isError ? 'bg-red-500/10 border border-red-500/30 text-red-300 rounded-tl-sm' : 'bg-surface border border-border text-gray-200 rounded-tl-sm'}`}>
+                    {msg.isError ? (
+                      <p className="whitespace-pre-wrap">{msg.text}</p>
+                    ) : msg.sender === 'user' ? (
+                      <p className="whitespace-pre-wrap">{msg.text}</p>
+                    ) : isDraftDoc ? (
+                      <DraftDocumentCard content={msg.text} filename={msg.downloadName} />
+                    ) : (
+                      <MarkdownMessage content={msg.text} />
+                    )}
                   {msg.toolsCalled && msg.toolsCalled.length > 0 && (
                     <p className="mt-2 flex items-center gap-1.5 text-[11px] text-gray-500">
                       <Wrench size={11} className="shrink-0" />
@@ -633,7 +642,7 @@ const ChatPanel = ({ projectId, mode = 'rag', reviewSession = null, onReviewFina
                   )}
                 </div>
               </div>
-            ))}
+            );})}
             {isTyping && (
               <div className="flex gap-3">
                 <div className="w-8 h-8 rounded-full bg-surface border border-border text-gray-400 flex items-center justify-center shrink-0">

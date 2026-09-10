@@ -106,4 +106,44 @@
   body.light-theme .markdown-body h3, body.light-theme .markdown-body strong { color: #111827; }
   body.light-theme .markdown-body code { background: #eef2f7; }
   body.light-theme .markdown-body pre { background: #f8fafc; border-color: #d8dee9; }
+
+  /* Markdown Message & Document Styling */
+  .markdown-message {
+    color: #e5e7eb;
+    line-height: 1.65;
+  }
+  .markdown-message table {
+    width: 100%;
+    border-collapse: collapse;
+  }
+  .markdown-message th,
+  .markdown-message td {
+    padding: 0.5rem 0.75rem;
+    border-color: #2E323E;
+  }
+  .markdown-message th {
+    background-color: rgba(30, 33, 42, 0.8);
+    font-weight: 600;
+  }
+  .markdown-message tr:hover td {
+    background-color: rgba(255, 255, 255, 0.02);
+  }
+  .markdown-message input[type="checkbox"] {
+    margin-right: 0.5rem;
+    accent-color: #8b5cf6;
+  }
+  body.light-theme .markdown-message {
+    color: #374151;
+  }
+  body.light-theme .markdown-message th {
+    background-color: #f1f5f9;
+    color: #1e293b;
+  }
+  body.light-theme .markdown-message th,
+  body.light-theme .markdown-message td {
+    border-color: #e2e8f0;
+  }
+  body.light-theme .markdown-message tr:hover td {
+    background-color: #f8fafc;
+  }
 }
