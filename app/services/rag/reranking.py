@@ -51,7 +51,7 @@ CROSS_ENCODER_MODEL_NAME = "Xenova/ms-marco-MiniLM-L-12-v2"
 # Calibrated against the L-6 model's score distribution — see the module
 # docstring note above. Re-run scripts/verify_relevance_floor.py to
 # re-calibrate for L-12 once the model has been exercised.
-RELEVANCE_FLOOR = -9.0
+RELEVANCE_FLOOR = -9.8
 
 
 @lru_cache(maxsize=1)

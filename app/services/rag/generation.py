@@ -23,12 +23,9 @@ class GenerationError(Exception):
     """Groq returned nothing usable for an answer or a summary."""
 
 
-# gpt-oss models reason before answering, and those hidden reasoning tokens
-# count against the (small) Groq daily budget AND against max_tokens. "low"
-# keeps enough chain-of-thought for a grounded extract/cite task while roughly
-# halving the reasoning overhead. If GROQ_MODEL is ever changed to a model that
-# rejects this value, drop the kwarg here.
-_REASONING_EFFORT = "low"
+# For qwen models, "none" disables reasoning overhead entirely.
+# For gpt-oss models, "low" keeps minimal chain-of-thought.
+_REASONING_EFFORT = "none" if "qwen" in GROQ_MODEL.lower() else "low"
 
 
 def _complete(messages: list[dict], *, temperature: float, max_tokens: int) -> str:

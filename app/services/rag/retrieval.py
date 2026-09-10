@@ -23,6 +23,8 @@ Pipeline (retrieve()):
   8. Final top TOP_K chunks.
 """
 
+import logging
+import time
 import uuid
 from dataclasses import dataclass, field
 
@@ -33,9 +35,14 @@ from app.models.document import Document
 from app.models.project import Project
 from app.services.access_control import (
     DocumentVisibility,
+    classify_documents_visibility,
     classify_document_visibility,
     get_accessible_stages_for_user,
     has_any_project_access,
+)
+from app.services.authorization_context import (
+    AuthorizationContext,
+    build_authorization_context,
 )
 from app.services.rag.collection_setup import (
     DENSE_VECTOR_NAME,
@@ -47,6 +54,8 @@ from app.services.rag.collection_setup import (
 from app.services.rag.embedding import embed_dense, embed_sparse
 from app.services.rag.reranking import RELEVANCE_FLOOR, rerank_scores
 from app.services.rag.stage_scope import resolve_stage_scope
+
+logger = logging.getLogger(__name__)
 
 COARSE_LIMIT = 50
 # Chunks handed to generation. Kept small on purpose: every chunk is re-sent
@@ -72,11 +81,29 @@ class RetrievedChunk:
 class RetrievalResult:
     chunks: list[RetrievedChunk] = field(default_factory=list)
     # True if ANY candidate document was blocked_by_sensitivity for this
-    # user (visible team, insufficient clearance) — generation (a later
-    # piece) uses this to offer a "request access" suggestion. The
-    # documents themselves are tracked too, for whenever that's built.
+    # user (visible team, insufficient clearance) — generation uses this
+    # to offer a "request access" suggestion.
     blocked_by_sensitivity: bool = False
     blocked_document_ids: list[uuid.UUID] = field(default_factory=list)
+    timing: dict = field(default_factory=dict)
+
+
+def _validate_point_payload(point) -> bool:
+    """Validate that required payload fields exist and are well-formed."""
+    payload = getattr(point, "payload", None)
+    if not isinstance(payload, dict):
+        return False
+    required = ("document_id", "project_id", "stage_id", "chunk_text", "section_title")
+    for k in required:
+        if k not in payload or payload[k] is None:
+            return False
+    try:
+        uuid.UUID(str(payload["document_id"]))
+        uuid.UUID(str(payload["project_id"]))
+        uuid.UUID(str(payload["stage_id"]))
+    except (ValueError, TypeError):
+        return False
+    return True
 
 
 def _resolve_scope(db: Session, user_id: uuid.UUID, project_id: uuid.UUID, stage_id: uuid.UUID | None) -> set[uuid.UUID]:
@@ -124,23 +151,23 @@ def _coarse_search(
 
 
 def _access_filter_candidates(
-    db: Session, user_id: uuid.UUID, points: list,
+    db: Session, auth_context: AuthorizationContext, points: list,
 ) -> tuple[list, list[uuid.UUID]]:
     """
-    Live per-candidate-DOCUMENT access check (one classify call per unique
-    document_id among the candidates, not per chunk). Returns
-    (fully_allowed_points, blocked_by_sensitivity_document_ids).
+    Batch ABAC document access check using request-scoped AuthorizationContext.
+    Executes in 1-2 queries total for all candidates rather than N queries.
+    Returns (fully_allowed_points, blocked_by_sensitivity_document_ids).
     """
-    doc_ids = {uuid.UUID(p.payload["document_id"]) for p in points}
-    documents = {d.document_id: d for d in db.query(Document).filter(Document.document_id.in_(doc_ids)).all()}
+    valid_points = [p for p in points if _validate_point_payload(p)]
+    if not valid_points:
+        return [], []
 
-    outcome_by_doc: dict[uuid.UUID, DocumentVisibility] = {}
-    for doc_id, document in documents.items():
-        outcome_by_doc[doc_id] = classify_document_visibility(db, user_id, document)
+    candidate_doc_ids = {uuid.UUID(p.payload["document_id"]) for p in valid_points}
+    outcome_by_doc = classify_documents_visibility(db, auth_context, candidate_doc_ids)
 
     allowed = []
     blocked_ids: list[uuid.UUID] = []
-    for p in points:
+    for p in valid_points:
         doc_id = uuid.UUID(p.payload["document_id"])
         outcome = outcome_by_doc.get(doc_id, DocumentVisibility.not_visible)
         if outcome == DocumentVisibility.fully_allowed:
@@ -179,37 +206,102 @@ def _rerank(query: str, points: list) -> list[RetrievedChunk]:
 
 
 def retrieve(
-    db: Session, user_id: uuid.UUID, project_id: uuid.UUID, query: str, stage_id: uuid.UUID | None = None,
+    db: Session,
+    user_id: uuid.UUID,
+    project_id: uuid.UUID,
+    query: str,
+    stage_id: uuid.UUID | None = None,
+    auth_context: AuthorizationContext | None = None,
 ) -> RetrievalResult:
     """
-    See module docstring for the full pipeline. Raises NoProjectAccessError
-    for a user with no relationship to the project — before any Qdrant call.
+    Executes the full retrieval pipeline:
+      1. Zero-access check via request-scoped AuthorizationContext.
+      2. Stage scope intersection with accessible stages.
+      3. Hybrid coarse search in Qdrant (dense + sparse + RRF).
+      4. Bounded batch ABAC visibility classification.
+      5. Cross-encoder neural rerank + calibrated relevance floor.
+      6. Final top-k chunks returned.
     """
-    if not has_any_project_access(db, user_id, project_id):
+    start_total = time.perf_counter()
+
+    if auth_context is None:
+        start_auth = time.perf_counter()
+        auth_context = build_authorization_context(db, user_id, project_id)
+        auth_time_ms = (time.perf_counter() - start_auth) * 1000
+    else:
+        auth_time_ms = 0.0
+
+    if not auth_context.team_ids and not auth_context.is_admin:
         raise NoProjectAccessError(f"User {user_id} has no access to project {project_id}")
 
-    scope = _resolve_scope(db, user_id, project_id, stage_id)
-    if not scope:
-        return RetrievalResult()  # nothing accessible in scope — legitimate empty result, not an error
+    # Scope resolution: accessible stages intersected with stage_scope if requested
+    scope = set(auth_context.accessible_stage_ids)
+    if stage_id is not None:
+        raw_scope = set(resolve_stage_scope(db, stage_id))
+        scope = scope & raw_scope
 
-    project = db.get(Project, project_id)
-    tenant_id = project.tenant_id
+    if not scope:
+        return RetrievalResult(timing={
+            "auth_ms": auth_time_ms,
+            "qdrant_ms": 0.0,
+            "abac_ms": 0.0,
+            "rerank_ms": 0.0,
+            "retrieval_total_ms": (time.perf_counter() - start_total) * 1000,
+        })
 
     client = get_qdrant_client()
-    collection = ensure_tenant_collection(client, tenant_id)
+    collection = ensure_tenant_collection(client, auth_context.tenant_id)
 
+    start_qdrant = time.perf_counter()
     coarse_points = _coarse_search(
-        client, collection, tenant_id=tenant_id, project_id=project_id, stage_ids=scope, query=query,
+        client,
+        collection,
+        tenant_id=auth_context.tenant_id,
+        project_id=project_id,
+        stage_ids=scope,
+        query=query,
     )
+    qdrant_time_ms = (time.perf_counter() - start_qdrant) * 1000
     if not coarse_points:
-        return RetrievalResult()
+        return RetrievalResult(timing={
+            "auth_ms": auth_time_ms,
+            "qdrant_ms": qdrant_time_ms,
+            "abac_ms": 0.0,
+            "rerank_ms": 0.0,
+            "retrieval_total_ms": (time.perf_counter() - start_total) * 1000,
+        })
 
-    allowed_points, blocked_ids = _access_filter_candidates(db, user_id, coarse_points)
+    start_abac = time.perf_counter()
+    allowed_points, blocked_ids = _access_filter_candidates(db, auth_context, coarse_points)
+    abac_time_ms = (time.perf_counter() - start_abac) * 1000
 
+    start_rerank = time.perf_counter()
     final_chunks = _rerank(query, allowed_points)[:TOP_K]
+    rerank_time_ms = (time.perf_counter() - start_rerank) * 1000
+
+    total_time_ms = (time.perf_counter() - start_total) * 1000
+    timing = {
+        "auth_ms": auth_time_ms,
+        "qdrant_ms": qdrant_time_ms,
+        "abac_ms": abac_time_ms,
+        "rerank_ms": rerank_time_ms,
+        "retrieval_total_ms": total_time_ms,
+    }
+    logger.debug(
+        "RAG Retrieval Timing: auth_ctx=%.1fms, qdrant=%.1fms, batch_abac=%.1fms, rerank=%.1fms, total=%.1fms (candidates=%d, allowed=%d, final=%d)",
+        auth_time_ms,
+        qdrant_time_ms,
+        abac_time_ms,
+        rerank_time_ms,
+        total_time_ms,
+        len(coarse_points),
+        len(allowed_points),
+        len(final_chunks),
+    )
 
     return RetrievalResult(
         chunks=final_chunks,
         blocked_by_sensitivity=bool(blocked_ids),
         blocked_document_ids=blocked_ids,
+        timing=timing,
     )
