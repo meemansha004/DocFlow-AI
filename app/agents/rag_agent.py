@@ -3,6 +3,7 @@ from agno.models.groq import Groq
 from agno.db.postgres import PostgresDb
 
 from app.tools.rag_tools import (
+    list_accessible_documents,
     request_confidential_access,
     search_documents,
     summarize_document,
@@ -23,9 +24,12 @@ rag_agent = Agent(
     # reasoning_effort="low": gpt-oss models reason before every reply and
     # those hidden tokens count against the daily Groq budget. Tool-routing
     # and relaying a tool result need very little chain-of-thought. Applies to
-    # both model calls this agent makes per turn (tool pick + any relay).
-    model=Groq(id=GROQ_MODEL, request_params={"reasoning_effort": "low"}),
-    tools=[search_documents, summarize_document, request_confidential_access],
+    model=Groq(
+        id=GROQ_MODEL,
+        max_tokens=800,
+        request_params={"reasoning_effort": "none" if "qwen" in GROQ_MODEL.lower() else "low"},
+    ),
+    tools=[search_documents, summarize_document, request_confidential_access, list_accessible_documents],
     db=db,
     # Follow-up replies ("yes", "the second one", "what about testing?") only
     # need the last couple of turns — and every agent call re-sends this whole

@@ -21,6 +21,7 @@ used to hard-reject a total stranger before any further, more expensive
 work (e.g. a Qdrant call in retrieval.py).
 """
 
+from collections import defaultdict
 import enum
 from datetime import datetime, timezone
 from uuid import UUID
@@ -32,6 +33,7 @@ from app.models.user import User
 from app.models.team import UserTeamMembership, ProjectAdmin, TeamRole, AccessRequest, AccessRequestStatus
 from app.models.document import Document, DocumentTeamVisibility, SensitivityLevel
 from app.models.stage import Stage, TeamStageAccess
+from app.services.authorization_context import AuthorizationContext
 
 
 # Rank order — higher index = more privileged. Used for cumulative comparison.
@@ -253,6 +255,101 @@ def classify_document_visibility(db: Session, user_id: UUID, document: Document)
         return DocumentVisibility.fully_allowed
 
     return DocumentVisibility.blocked_by_sensitivity  # viewer, or contributor with no grant
+
+
+def classify_documents_visibility(
+    db: Session,
+    auth_context: AuthorizationContext,
+    document_ids: list[UUID] | set[UUID],
+) -> dict[UUID, DocumentVisibility]:
+    """
+    Batch ABAC evaluation for candidate documents.
+    Executes in 1-2 queries total instead of N queries per candidate document.
+
+    Returns:
+        dict mapping each requested document_id to DocumentVisibility:
+          - fully_allowed
+          - blocked_by_sensitivity
+          - not_visible
+    """
+    if not document_ids:
+        return {}
+
+    unique_doc_ids = list(set(document_ids))
+    out: dict[UUID, DocumentVisibility] = {
+        doc_id: DocumentVisibility.not_visible for doc_id in unique_doc_ids
+    }
+
+    # Step 1: Batch-fetch all matching candidate documents in project
+    docs = db.execute(
+        select(Document).where(
+            Document.document_id.in_(unique_doc_ids),
+            Document.tenant_id == auth_context.tenant_id,
+            Document.project_id == auth_context.project_id,
+        )
+    ).scalars().all()
+
+    if not docs:
+        return out
+
+    doc_map = {d.document_id: d for d in docs}
+
+    # Step 2: Org Admin & Project Admin bypass
+    if auth_context.is_admin:
+        for doc_id in doc_map:
+            out[doc_id] = DocumentVisibility.fully_allowed
+        return out
+
+    # Step 3: Batch-fetch document team visibilities in ONE query
+    dtv_rows = db.execute(
+        select(DocumentTeamVisibility).where(
+            DocumentTeamVisibility.document_id.in_(list(doc_map.keys()))
+        )
+    ).scalars().all()
+
+    doc_visible_teams: dict[UUID, set[UUID]] = defaultdict(set)
+    for row in dtv_rows:
+        doc_visible_teams[row.document_id].add(row.team_id)
+
+    # Step 4: Evaluate visibility & sensitivity in-memory per document
+    for doc_id, document in doc_map.items():
+        visible_teams = doc_visible_teams.get(doc_id, set())
+        overlapping_teams = visible_teams & auth_context.team_ids
+
+        if not overlapping_teams:
+            out[doc_id] = DocumentVisibility.not_visible
+            continue
+
+        # Sensitivity check: Public & Internal
+        if document.sensitivity_level in (SensitivityLevel.public, SensitivityLevel.internal):
+            out[doc_id] = DocumentVisibility.fully_allowed
+            continue
+
+        # Sensitivity check: Confidential
+        if document.sensitivity_level == SensitivityLevel.confidential:
+            # Check highest role on any overlapping team
+            roles = [auth_context.team_roles.get(tid) for tid in overlapping_teams]
+            max_rank = max((_TEAM_ROLE_RANK[r] for r in roles if r in _TEAM_ROLE_RANK), default=-1)
+
+            if max_rank >= _TEAM_ROLE_RANK[TeamRole.team_lead]:
+                out[doc_id] = DocumentVisibility.fully_allowed
+                continue
+
+            # Contributor with active approved grant
+            contributor_teams = {
+                tid for tid in overlapping_teams if auth_context.team_roles.get(tid) == TeamRole.contributor
+            }
+            if contributor_teams & auth_context.active_confidential_grant_team_ids:
+                out[doc_id] = DocumentVisibility.fully_allowed
+                continue
+
+            out[doc_id] = DocumentVisibility.blocked_by_sensitivity
+            continue
+
+        # Restricted or unhandled sensitivity
+        out[doc_id] = DocumentVisibility.blocked_by_sensitivity
+
+    return out
 
 
 def can_view_document(db: Session, user_id: UUID, document: Document) -> bool:

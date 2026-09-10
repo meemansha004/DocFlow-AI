@@ -34,7 +34,7 @@ SPARSE_VECTOR_NAME = "sparse"
 
 # Payload fields every point carries and that filtering is scoped to.
 # Keep in sync with the payload indexes created below.
-INDEXED_PAYLOAD_FIELDS = ("tenant_id", "project_id", "stage_id")
+INDEXED_PAYLOAD_FIELDS = ("tenant_id", "project_id", "stage_id", "document_id")
 
 
 @lru_cache(maxsize=1)

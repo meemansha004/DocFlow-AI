@@ -23,6 +23,7 @@ The agno session id is `rag-<canonical uuid>` — namespaced so it can never
 collide with a drafting/scanner session that happens to reuse the same uuid.
 """
 
+import time
 import uuid
 
 from agno.run.base import RunStatus
@@ -30,7 +31,7 @@ from agno.run.base import RunStatus
 from app.agents.rag_agent import rag_agent
 from app.database import SessionLocal
 from app.services.chat_history import append_message, resolve_chat_session
-from app.services.rag_context import reset_rag_context, set_rag_context
+from app.services.rag_context import get_rag_context, reset_rag_context, set_rag_context
 
 _TOOL_NAMES = ("search_documents", "summarize_document", "request_confidential_access")
 
@@ -87,15 +88,25 @@ def run_rag_turn(
         append_message(db, session_id=canonical, role="user", content=message)
         db.commit()  # the user's turn is recorded even if the agent call fails
 
+        t_turn_start = time.perf_counter()
         token = set_rag_context(user_id=user_id, project_id=project_id)
+        telemetry = {}
         try:
+            t_agent_start = time.perf_counter()
             response = rag_agent.run(
                 message or "continue",
                 session_id=_agno_session_id(canonical),
                 user_id=str(user_id),
             )
+            t_agent = (time.perf_counter() - t_agent_start) * 1000
+            ctx = get_rag_context()
+            telemetry = dict(ctx.telemetry)
+            telemetry["agent_total_ms"] = t_agent
         finally:
             reset_rag_context(token)
+
+        t_turn_total = (time.perf_counter() - t_turn_start) * 1000
+        telemetry["turn_total_ms"] = t_turn_total
 
         # A failed model call (Agno swallows it and puts the provider error in
         # .content) must not be persisted as an assistant turn or returned as
@@ -112,6 +123,11 @@ def run_rag_turn(
         append_message(db, session_id=canonical, role="assistant", content=reply)
         db.commit()
 
-        return {"reply": reply, "tools_called": tools, "session_id": str(canonical)}
+        return {
+            "reply": reply,
+            "tools_called": tools,
+            "session_id": str(canonical),
+            "timing": telemetry,
+        }
     finally:
         db.close()

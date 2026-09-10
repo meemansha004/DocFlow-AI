@@ -99,6 +99,7 @@ class RagMessageResponse(BaseModel):
     reply: str
     tools_called: list[str] = []
     session_id: str  # canonical id — echo it back on the next turn
+    timing: dict = {}
 
 
 @router.post("/rag/message", response_model=RagMessageResponse)
@@ -135,6 +136,7 @@ def rag_message(
         reply=turn["reply"],
         tools_called=turn["tools_called"],
         session_id=turn["session_id"],
+        timing=turn.get("timing", {}),
     )
 
 
