@@ -27,7 +27,7 @@ _REF_STOPWORDS = {
     "the", "a", "an", "document", "doc", "file", "of", "for", "about", "please",
     "whole", "entire", "this", "that", "our", "my", "summary", "overview",
 }
-_DOC_EXT_RE = re.compile(r"\.(md|pdf|docx|doc|txt)$", re.IGNORECASE)
+_DOC_EXT_RE = re.compile(r"(\.|\s+)(md|pdf|docx|doc|txt)$", re.IGNORECASE)
 
 
 def normalize_ref(s: str) -> str:
@@ -72,6 +72,12 @@ def match_documents(db, project_id: uuid.UUID, ref: str) -> list[Document]:
         if not stem:
             continue
         if ref_stem == stem or ref_stem in fn or stem in ref_n:
+            strong.append(d)
+            continue
+        words = [w for w in stem.split() if w]
+        acronym = "".join(w[0] for w in words if w not in _REF_STOPWORDS)
+        acronym_all = "".join(w[0] for w in words)
+        if ref_stem in (acronym, acronym_all) or (acronym and acronym in ref_tokens) or (acronym_all and acronym_all in ref_tokens):
             strong.append(d)
             continue
         fn_tokens = {t for t in stem.split() if t not in _REF_STOPWORDS and len(t) > 2}

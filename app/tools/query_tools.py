@@ -21,6 +21,8 @@ Each tool returns a dict with a "status" field. A document the caller cannot
 see is reported as "not_found" with no hint that it exists.
 """
 
+import os
+import re
 import uuid
 
 from sqlalchemy import select
@@ -28,20 +30,25 @@ from sqlalchemy import select
 from app.database import SessionLocal
 from app.models.document import Document, DocumentVersion
 from app.models.project import Project
+from app.models.required_document import RequiredDocument
 from app.models.stage import Stage, TeamStageAccess
 from app.models.team import Team, TeamRole, UserTeamMembership
 from app.models.user import User
 from app.models.workflow import WorkflowState
 from app.services.access_control import (
+    DocumentVisibility,
     _get_team_membership,
     _is_org_admin,
     _is_project_admin,
+    build_access_filter,
     can_view_document,
+    classify_documents_visibility,
     has_permission,
     has_stage_access,
 )
 from app.services.access_requests_service import pending_requests_for_reviewer
-from app.services.document_lookup import match_documents, resolve_stage, resolve_team
+from app.services.authorization_context import AuthorizationContext, build_authorization_context
+from app.services.document_lookup import match_documents, normalize_ref, resolve_stage, resolve_team
 from app.services.pending_approvals import documents_awaiting_approval, reviews_project
 from app.services.query_context import get_query_context
 
@@ -420,3 +427,291 @@ def get_project_structure() -> dict:
         }
     finally:
         db.close()
+
+
+# ---------------------------------------------------------------------------
+# 7. get_stage_requirements
+# ---------------------------------------------------------------------------
+
+@tool
+def get_stage_requirements(stage_reference: str) -> dict:
+    """Checklist requirements for a specific stage from the required_documents
+    table: document names, descriptions, and which are mandatory.
+    `stage_reference` is a stage name or UUID.
+    Status "not_found" if no matching stage exists in this project.
+    """
+    ctx = get_query_context()
+    db = SessionLocal()
+    try:
+        ref = (stage_reference or "").strip()
+        stage_id = resolve_stage(db, ctx.project_id, ref)
+        if stage_id is None:
+            return {
+                "status": "not_found",
+                "message": f"No stage matching '{ref}' exists in this project.",
+            }
+
+        stage = db.get(Stage, stage_id)
+        reqs = db.execute(
+            select(RequiredDocument)
+            .where(RequiredDocument.stage_id == stage_id)
+            .order_by(RequiredDocument.created_at.asc())
+        ).scalars().all()
+
+        return {
+            "status": "ok",
+            "stage": stage.name if stage else ref,
+            "requirements": [
+                {
+                    "name": r.name,
+                    "description": r.description or "",
+                    "mandatory": r.is_mandatory,
+                }
+                for r in reqs
+            ],
+            "mandatory_count": sum(1 for r in reqs if r.is_mandatory),
+            "total_count": len(reqs),
+        }
+    finally:
+        db.close()
+
+
+_NEGATIVE_QUALIFIERS = {"notes", "meeting", "minutes", "summary", "template", "draft", "scratch", "review"}
+
+
+def _clean_stem(filename: str) -> str:
+    stem, _ = os.path.splitext(filename)
+    return stem.strip()
+
+
+def _tokenize(text: str) -> list[str]:
+    return [t for t in re.split(r"[^a-zA-Z0-9]+", text.lower()) if t]
+
+
+def match_document_to_requirement(req_name: str, filename: str) -> tuple[bool, str | None]:
+    """
+    Deterministic requirement satisfaction matcher.
+    Hierarchy:
+      1. Exact normalized stem match (e.g. 'Software Requirements Specification.pdf' == 'Software Requirements Specification')
+      2. Exact stem ignoring trailing version / status tags (e.g. 'Software Requirements Specification v1.0.md')
+      3. Contiguous whole phrase containment (requirement tokens appear in contiguous sequence in doc tokens),
+         with negative qualifier guard: reject matches if filename introduces negative qualifiers ('notes', 'meeting', 'minutes', etc.)
+         not present in the requirement definition.
+      4. Acronym token match (for requirements with 3+ words, e.g. 'Software Requirements Specification' -> 'srs')
+         provided negative qualifiers are not introduced.
+      5. Otherwise unmatched.
+
+    Never allows doc tokens in requirement tokens (a short generic filename cannot satisfy a specific requirement).
+    """
+    req_tokens = _tokenize(req_name)
+    if not req_tokens:
+        return False, None
+
+    doc_stem = _clean_stem(filename)
+    doc_tokens = _tokenize(doc_stem)
+    if not doc_tokens:
+        return False, None
+
+    # 1. Exact normalized stem
+    if req_tokens == doc_tokens:
+        return True, "exact_stem"
+
+    # 2. Exact stem ignoring trailing version / status tags
+    cleaned_doc_tokens = [
+        t for t in doc_tokens
+        if not re.match(r"^v?\d+(\.\d+)*$", t) and t not in {"final", "approved"}
+    ]
+    if cleaned_doc_tokens == req_tokens:
+        return True, "exact_stem_version_ignored"
+
+    # Check for negative qualifiers introduced by the document
+    req_token_set = set(req_tokens)
+    doc_token_set = set(doc_tokens)
+    extra_tokens = doc_token_set - req_token_set
+    introduced_negative = _NEGATIVE_QUALIFIERS.intersection(extra_tokens)
+    if introduced_negative:
+        # Document is notes, meeting minutes, summary, etc. when requirement isn't
+        return False, None
+
+    # 3. Contiguous phrase containment
+    req_len = len(req_tokens)
+    doc_len = len(doc_tokens)
+    if doc_len >= req_len:
+        for i in range(doc_len - req_len + 1):
+            if doc_tokens[i : i + req_len] == req_tokens:
+                return True, "contained_phrase"
+
+    # 4. Standard acronym match (for 3+ word requirements, e.g. SRS)
+    if req_len >= 3:
+        acronym = "".join(t[0] for t in req_tokens)
+        if len(acronym) >= 3 and acronym in doc_tokens:
+            return True, "acronym_match"
+
+    return False, None
+
+
+# ---------------------------------------------------------------------------
+# 8. get_stage_document_status
+# ---------------------------------------------------------------------------
+
+@tool
+def get_stage_document_status(stage_reference: str) -> dict:
+    """Document completeness status for a stage: which required documents
+    exist, which are missing, coverage percentage, and satisfied mandatory items.
+    `stage_reference` is a stage name or UUID.
+    Status "not_found" if no matching stage exists in this project.
+    """
+    ctx = get_query_context()
+    db = SessionLocal()
+    try:
+        ref = (stage_reference or "").strip()
+        stage_id = resolve_stage(db, ctx.project_id, ref)
+        if stage_id is None:
+            return {
+                "status": "not_found",
+                "message": f"No stage matching '{ref}' exists in this project.",
+            }
+
+        stage = db.get(Stage, stage_id)
+        reqs = db.execute(
+            select(RequiredDocument)
+            .where(RequiredDocument.stage_id == stage_id)
+            .order_by(RequiredDocument.created_at.asc())
+        ).scalars().all()
+
+        # Batch-load visible documents using AuthorizationContext
+        auth_ctx = build_authorization_context(db, ctx.user_id, ctx.project_id)
+        stage_docs = db.execute(
+            select(Document).where(
+                Document.project_id == ctx.project_id,
+                Document.stage_id == stage_id,
+                Document.tenant_id == auth_ctx.tenant_id,
+            )
+        ).scalars().all()
+
+        doc_ids = [d.document_id for d in stage_docs]
+        vis_map = classify_documents_visibility(db, auth_ctx, doc_ids)
+        visible_docs = [
+            d for d in stage_docs
+            if vis_map.get(d.document_id) == DocumentVisibility.fully_allowed
+        ]
+        doc_names = [d.original_filename for d in visible_docs]
+
+        satisfied_requirements = []
+        missing_requirements = []
+        missing_mandatory = []
+        satisfied_mandatory_count = 0
+        total_mandatory_count = sum(1 for r in reqs if r.is_mandatory)
+        requirements_details = []
+
+        for r in reqs:
+            matched_doc = None
+            matched_rule = None
+            for d in visible_docs:
+                is_match, rule = match_document_to_requirement(r.name, d.original_filename)
+                if is_match:
+                    matched_doc = d.original_filename
+                    matched_rule = rule
+                    break
+
+            if matched_doc:
+                satisfied_requirements.append(r.name)
+                if r.is_mandatory:
+                    satisfied_mandatory_count += 1
+                requirements_details.append({
+                    "requirement": r.name,
+                    "mandatory": r.is_mandatory,
+                    "status": "satisfied",
+                    "satisfied_by": matched_doc,
+                    "match_rule": matched_rule,
+                })
+            else:
+                missing_requirements.append(r.name)
+                if r.is_mandatory:
+                    missing_mandatory.append(r.name)
+                requirements_details.append({
+                    "requirement": r.name,
+                    "mandatory": r.is_mandatory,
+                    "status": "missing",
+                    "satisfied_by": None,
+                    "match_rule": None,
+                })
+
+        if total_mandatory_count > 0:
+            coverage = round((satisfied_mandatory_count / total_mandatory_count) * 100.0, 1)
+        elif len(reqs) > 0:
+            coverage = round((len(satisfied_requirements) / len(reqs)) * 100.0, 1)
+        else:
+            coverage = 100.0
+
+        return {
+            "status": "ok",
+            "stage": stage.name if stage else ref,
+            "coverage_percentage": coverage,
+            "total_requirements": len(reqs),
+            "mandatory_requirements_count": total_mandatory_count,
+            "satisfied_mandatory_count": satisfied_mandatory_count,
+            "missing_mandatory": missing_mandatory,
+            "satisfied_documents": satisfied_requirements,
+            "missing_documents": missing_requirements,
+            "uploaded_documents_in_stage": doc_names,
+            "requirements_details": requirements_details,
+        }
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# 9. list_accessible_documents
+# ---------------------------------------------------------------------------
+
+@tool
+def list_accessible_documents(stage_reference: str | None = None) -> dict:
+    """Lists all documents in this project that the user is authorized to view
+    under their current team membership, clearance level, and stage access.
+    Optionally filters by `stage_reference` (stage name or UUID). Call this whenever
+    the user asks 'what documents do I have access to', 'which documents can I see',
+    or asks for a list of project documents.
+    """
+    ctx = get_query_context()
+    db = SessionLocal()
+    try:
+        auth_ctx = build_authorization_context(db, ctx.user_id, ctx.project_id)
+        query = db.query(Document).filter(
+            Document.project_id == ctx.project_id,
+            Document.tenant_id == auth_ctx.tenant_id,
+        )
+
+        stage_name = None
+        if stage_reference:
+            stage_id = resolve_stage(db, ctx.project_id, stage_reference)
+            if stage_id is not None:
+                query = query.filter(Document.stage_id == stage_id)
+                stg = db.get(Stage, stage_id)
+                stage_name = stg.name if stg else str(stage_id)
+
+        all_docs = query.order_by(Document.created_at.desc()).all()
+        doc_ids = [d.document_id for d in all_docs]
+        vis_map = classify_documents_visibility(db, auth_ctx, doc_ids)
+
+        visible = [d for d in all_docs if vis_map.get(d.document_id) == DocumentVisibility.fully_allowed]
+
+        return {
+            "status": "ok",
+            "scope": f"stage '{stage_name}'" if stage_name else "entire project",
+            "count": len(visible),
+            "documents": [
+                {
+                    "name": d.original_filename,
+                    "stage": _stage_name(db, d.stage_id),
+                    "sensitivity": d.sensitivity_level.name,
+                    "uploaded_by": _email(db, d.uploaded_by),
+                    "uploaded_at": d.created_at.isoformat() if d.created_at else None,
+                }
+                for d in visible
+            ],
+        }
+    finally:
+        db.close()
+
+
