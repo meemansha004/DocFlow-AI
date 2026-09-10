@@ -291,11 +291,13 @@ if doc_g_id in rrf_score_by_doc and doc_h_id in rrf_score_by_doc:
         check(ce_h > ce_g, "and correctly prefers doc H (genuinely on-topic) over doc G (keyword-heavy but off-topic)")
 
 # Separately: confirm the relevance floor (step 7) does its job on this same query.
+from app.services.rag.reranking import RELEVANCE_FLOOR
 final = retrieve(db, uid("carol@test.com"), PA.project_id, query, stage_id=DEVELOPMENT.stage_id)
-print(f"\n  Full retrieve() with the relevance floor applied: {len(final.chunks)} final chunk(s)")
+print(f"\n  Full retrieve() with the relevance floor ({RELEVANCE_FLOOR}) applied: {len(final.chunks)} final chunk(s)")
 for ch in final.chunks:
     print(f"    doc={str(ch.document_id)[:8]} score={ch.score:.2f} text={ch.chunk_text[:55]!r}")
-check(all(ch.score > 0 for ch in final.chunks), "every chunk that survives the floor has a positive cross-encoder score")
+check(all(ch.score > RELEVANCE_FLOOR for ch in final.chunks),
+      f"every chunk that survives the floor scores above RELEVANCE_FLOOR ({RELEVANCE_FLOOR})")
 
 
 # ---------------------------------------------------------------------------

@@ -83,9 +83,13 @@ Retrieval scope expands exactly one hop (a stage plus the stages it directly
 references). Following chains (A → B → C) is deliberately not done.
 _Source: `app/services/rag/stage_scope.py`._
 
-**11. Retrieval tuning knobs.**
+**11. Retrieval tuning knobs — a proper labelled eval set.**
 `COARSE_LIMIT`, `TOP_K`, `RELEVANCE_FLOOR` are fixed global constants — no
-per-project or per-query tuning.
+per-project or per-query tuning, and calibrated by hand against a small
+synthetic set (`scripts/verify_relevance_floor.py`), not a real labelled
+retrieval eval. (`RELEVANCE_FLOOR` itself was a live bug — miscalibrated at
+`0.0` — and is now fixed at `-9.0`; this item is the remaining work: a real
+eval set and, eventually, tuning per corpus.)
 _Source: `app/services/rag/retrieval.py`, `reranking.py`._
 
 **12. Conversational query rewriting / expansion.**
