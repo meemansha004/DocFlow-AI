@@ -3,6 +3,7 @@ import { useParams, Link } from 'react-router-dom';
 import { ArrowLeft, Lock, PanelRight } from 'lucide-react';
 import SourcePanel from '../components/sources/SourcePanel';
 import ChatPanel from '../components/chat/ChatPanel';
+import ChatModeTabs from '../components/chat/ChatModeTabs';
 import StudioPanel from '../components/studio/StudioPanel';
 import Badge from '../components/ui/Badge';
 import Modal from '../components/ui/Modal';
@@ -26,6 +27,10 @@ const ProjectWorkspace = () => {
   // not a blank drafting conversation). Cleared on "Back to drafting" or
   // uploading a different document.
   const [reviewSession, setReviewSession] = useState(null);
+
+  // Chat Interface mode — deterministic tab selection (Draft | Scan | Search |
+  // Query). An active reviewSession overrides this (upload -> review flow).
+  const [chatTab, setChatTab] = useState('draft');
 
   // Studio side panel (Part 2) — hidden by default, opened from the toolbar.
   const [studioOpen, setStudioOpen] = useState(false);
@@ -249,9 +254,11 @@ const ProjectWorkspace = () => {
             internal scroll and the input never scrolls away. Switches into
             document-review mode the moment an upload succeeds. */}
         <div className="w-full lg:flex-1 shrink-0 flex flex-col h-[70vh] lg:h-full lg:min-h-0 overflow-hidden border-t border-border lg:border-t-0 lg:border-l">
+          {!reviewSession && <ChatModeTabs active={chatTab} onChange={setChatTab} />}
           <ChatPanel
+            key={reviewSession ? 'review' : chatTab}
             projectId={projectId}
-            mode={reviewSession ? 'review' : 'draft'}
+            mode={reviewSession ? 'review' : chatTab}
             reviewSession={reviewSession}
             onReviewFinalized={handleReviewFinalized}
             onReviewExit={() => setReviewSession(null)}

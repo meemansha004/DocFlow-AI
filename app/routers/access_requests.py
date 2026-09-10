@@ -40,6 +40,7 @@ from app.services.access_requests_service import (
     AccessRequestError,
     GRANT_TTL_DAYS as _GRANT_TTL_DAYS,
     is_expired as _is_expired,
+    pending_requests_for_reviewer,
     request_confidential_access,
 )
 from app.services.audit import record_audit
@@ -131,23 +132,10 @@ def pending_access_requests(
     identity: ResolvedIdentity = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    rows = db.execute(
-        select(AccessRequest)
-        .where(AccessRequest.status == AccessRequestStatus.pending)
-        .order_by(AccessRequest.requested_at.desc())
-    ).scalars().all()
-    out: list[AccessRequestOut] = []
-    for r in rows:
-        team = db.get(Team, r.team_id)
-        project = db.get(Project, team.project_id) if team else None
-        if team is None or project is None or project.tenant_id != identity.tenant_id:
-            continue
-        if not has_permission(
-            db, identity.user_id, "approve_access_request", team.team_id, team.project_id
-        ):
-            continue
-        out.append(_serialize(db, r, team=team, project=project))
-    return out
+    rows = pending_requests_for_reviewer(
+        db, reviewer_id=identity.user_id, tenant_id=identity.tenant_id
+    )
+    return [_serialize(db, r) for r in rows]
 
 
 def _decide(db: Session, identity: ResolvedIdentity, request_id: uuid.UUID, *, approve: bool) -> AccessRequestOut:

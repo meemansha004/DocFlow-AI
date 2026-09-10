@@ -38,10 +38,20 @@ def _parse_uuid(value: str | None) -> uuid.UUID | None:
 
 
 def resolve_chat_session(
-    db: Session, *, session_id: str | None, user_id: uuid.UUID, project_id: uuid.UUID
+    db: Session,
+    *,
+    session_id: str | None,
+    user_id: uuid.UUID,
+    project_id: uuid.UUID,
+    mode: str = "rag",
 ) -> ChatSession:
     """
     Return the ChatSession for this turn, creating it if needed.
+
+    `mode` ('rag' | 'query') is stamped on a newly created session and tags
+    which chat agent owns it. It is NOT part of the ownership check — an
+    existing session is returned regardless of its mode as long as it belongs
+    to (user_id, project_id).
 
     - `session_id` is a real, existing session UUID owned by (user_id,
       project_id) -> reuse it.
@@ -63,9 +73,11 @@ def resolve_chat_session(
                     f"Chat session {sid} does not belong to this user/project."
                 )
             return existing
-        session = ChatSession(session_id=sid, user_id=user_id, project_id=project_id)
+        session = ChatSession(
+            session_id=sid, user_id=user_id, project_id=project_id, mode=mode
+        )
     else:
-        session = ChatSession(user_id=user_id, project_id=project_id)
+        session = ChatSession(user_id=user_id, project_id=project_id, mode=mode)
 
     db.add(session)
     db.flush()

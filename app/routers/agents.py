@@ -1,16 +1,18 @@
 """
-HTTP surface for the Drafting + Scanner agents — the CLI's /draft loop exposed
-over HTTP.
+HTTP surface for the Drafting, RAG, and Scanner agents — the CLI's chat loop
+exposed over HTTP.
 
   POST /agents/draft/message            one drafting turn { session_id, message }
   GET  /agents/draft/download/{filename} download a finalized draft
+  POST /agents/rag/message              one RAG turn { session_id?, project_id, message }
+  POST /agents/query/message            one Query turn { session_id?, project_id, message }
+  POST /agents/scan/message             one standalone-scan turn { session_id, message }
 
-DECOUPLED FROM PERSISTENCE (MERGE_DECISIONS §4): finalizing a draft here scores
-it with the Structure Scanner and writes a standalone Markdown file under
-drafts/ — it never creates a Document row, never touches has_permission(), and
-never asks about a stage/team/project. Real persistence is POST
-/documents/upload. The endpoints only require authentication; there is no ABAC
-because there is no project resource involved.
+DECOUPLED FROM PERSISTENCE (MERGE_DECISIONS §4): /draft and /scan never create a
+Document row, never touch has_permission(), and never ask about a stage/team/
+project — they only require authentication, and there is no ABAC because there
+is no project resource involved. /rag IS project-scoped: it checks project
+access and enforces per-(user, project) conversation ownership.
 """
 
 import uuid
@@ -29,7 +31,9 @@ from app.services.auth import ResolvedIdentity
 from app.services.chat_history import SessionScopeError
 from app.services.draft_chat import run_draft_turn
 from app.services.draft_export import DRAFTS_DIR
+from app.services.query_chat import QueryTurnError, run_query_turn
 from app.services.rag_chat import run_rag_turn
+from app.services.scan_chat import ScanTurnError, run_scan_turn
 
 router = APIRouter(prefix="/agents", tags=["agents"])
 
@@ -132,6 +136,112 @@ def rag_message(
         tools_called=turn["tools_called"],
         session_id=turn["session_id"],
     )
+
+
+class QueryMessageRequest(BaseModel):
+    # Omit on the first turn; pass the session_id from the previous response
+    # to continue the same conversation.
+    session_id: str | None = Field(default=None, max_length=200)
+    project_id: uuid.UUID
+    message: str = Field(min_length=1, max_length=20000)
+
+
+class QueryMessageResponse(BaseModel):
+    reply: str
+    tools_called: list[str] = []
+    session_id: str  # canonical id — echo it back on the next turn
+
+
+@router.post("/query/message", response_model=QueryMessageResponse)
+def query_message(
+    body: QueryMessageRequest,
+    identity: ResolvedIdentity = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    One turn of the read-only metadata Q&A chat (the Query tab). Project-scoped
+    exactly like /rag/message: project access is checked, and conversation
+    ownership is enforced per (user, project).
+    """
+    if body.session_id is not None and Path(body.session_id).name != body.session_id:
+        raise HTTPException(status_code=422, detail="Invalid session_id")
+
+    project = db.get(Project, body.project_id)
+    if project is None or project.tenant_id != identity.tenant_id:
+        raise HTTPException(status_code=404, detail="Project not found")
+    if not has_any_project_access(db, identity.user_id, body.project_id):
+        raise HTTPException(status_code=403, detail="You don't have access to this project")
+
+    try:
+        turn = run_query_turn(
+            user_id=identity.user_id,
+            project_id=body.project_id,
+            session_id=body.session_id,
+            message=body.message,
+        )
+    except SessionScopeError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except QueryTurnError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"The Query agent could not complete this turn: {exc}",
+        ) from exc
+    except Exception as exc:  # noqa: BLE001 — Groq / rate-limit failures
+        raise HTTPException(
+            status_code=502,
+            detail=f"The Query agent could not complete this turn: {exc}",
+        ) from exc
+
+    return QueryMessageResponse(
+        reply=turn["reply"],
+        tools_called=turn["tools_called"],
+        session_id=turn["session_id"],
+    )
+
+
+class ScanMessageRequest(BaseModel):
+    session_id: str = Field(min_length=1, max_length=200)
+    message: str = Field(min_length=1, max_length=200000)
+
+
+class ScanMessageResponse(BaseModel):
+    reply: str
+    tools_called: list[str] = []
+
+
+@router.post("/scan/message", response_model=ScanMessageResponse)
+def scan_message(
+    body: ScanMessageRequest,
+    identity: ResolvedIdentity = Depends(get_current_user),
+):
+    """
+    One turn of the standalone Structure Scanner chat (DEFERRED_ITEMS.md #4):
+    paste content, get it scored / reformed / injection-checked independently
+    of any drafting or upload flow.
+
+    Like /draft/message this is decoupled from persistence — authentication
+    only, no project/stage/team, no ABAC (nothing is written anywhere).
+    session_id is the caller's own opaque conversation id; it only scopes the
+    Scanner Agent's in-context history.
+    """
+    safe_id = Path(body.session_id).name
+    if safe_id != body.session_id:
+        raise HTTPException(status_code=422, detail="Invalid session_id")
+
+    try:
+        turn = run_scan_turn(safe_id, body.message)
+    except ScanTurnError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"The scanner agent could not complete this turn: {exc}",
+        ) from exc
+    except Exception as exc:  # noqa: BLE001 — Groq / rate-limit / parse failures
+        raise HTTPException(
+            status_code=502,
+            detail=f"The scanner agent could not complete this turn: {exc}",
+        ) from exc
+
+    return ScanMessageResponse(reply=turn["reply"], tools_called=turn["tools_called"])
 
 
 @router.get("/draft/download/{filename}")

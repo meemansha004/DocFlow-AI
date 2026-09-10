@@ -369,10 +369,50 @@ export const accessRequestsApi = {
   deny: (id) => request(`/access-requests/${encodeURIComponent(id)}/deny`, { method: 'POST' }),
 };
 
-export const ragApi = stub('RAG / retrieval');
-export const chatApi = stub('chat');
+// ---------- RAG Agent: REAL (Phase C) — the Search tab ----------
+// POST /agents/rag/message runs one grounded-retrieval turn. Conversation
+// ownership is per (user, project); pass session_id back to continue, or omit
+// it (null) to start fresh.
+export const ragApi = {
+  // -> { reply, tools_called: [...], session_id }
+  message: (projectId, sessionId, message) =>
+    request('/agents/rag/message', {
+      method: 'POST',
+      body: { project_id: projectId, session_id: sessionId || null, message },
+    }),
+};
 
-// ---------- Agents: Drafting flow is REAL (decoupled from persistence) ----------
+// ---------- Query Agent: REAL — the Query tab (read-only metadata Q&A) ----------
+// POST /agents/query/message runs one read-only metadata lookup turn. Same
+// per-(user, project) conversation ownership as ragApi; pass session_id back to
+// continue, or omit it (null) to start fresh.
+export const queryApi = {
+  // -> { reply, tools_called: [...], session_id }
+  message: (projectId, sessionId, message) =>
+    request('/agents/query/message', {
+      method: 'POST',
+      body: { project_id: projectId, session_id: sessionId || null, message },
+    }),
+};
+
+// ---------- Chat history: REAL — the Search tab's history sidebar / reload ----------
+// Read-only view of chat_sessions / chat_messages (written server-side by the
+// agent runners). Starting a new conversation is just "send with no session_id".
+export const chatApi = {
+  // -> [{ session_id, title, started_at }]
+  sessions: (projectId, mode) =>
+    request(
+      `/chat/sessions?project_id=${encodeURIComponent(projectId)}` +
+        (mode ? `&mode=${encodeURIComponent(mode)}` : ''),
+    ),
+  // -> [{ message_id, role, content, created_at, sources }]
+  messages: (sessionId) =>
+    request(`/chat/sessions/${encodeURIComponent(sessionId)}/messages`),
+  removeSession: (sessionId) =>
+    request(`/chat/sessions/${encodeURIComponent(sessionId)}`, { method: 'DELETE' }),
+};
+
+// ---------- Agents: Drafting + standalone Scan flows are REAL (decoupled from persistence) ----------
 // POST /agents/draft/message runs one drafting turn; the finalized draft is a
 // standalone local file fetched via GET /agents/draft/download/{filename}.
 export const agentsApi = {
@@ -382,6 +422,13 @@ export const agentsApi = {
     request('/agents/draft/message', {
       method: 'POST',
       body: { session_id: sessionId, message: message || '' },
+    }),
+  // Standalone Structure Scanner chat (DEFERRED_ITEMS.md #4). Auth only, no
+  // project/persistence. -> { reply, tools_called: [...] }
+  scanMessage: (sessionId, message) =>
+    request('/agents/scan/message', {
+      method: 'POST',
+      body: { session_id: sessionId, message },
     }),
   // Auth'd blob fetch — a plain <a href download> can't send the Bearer token.
   draftDownload: async (downloadUrl) => {

@@ -17,10 +17,7 @@ verbatim in spirit — it must not invent an answer, a summary, a citation, or
 a confirmation that a tool did not return.
 """
 
-import re
 import uuid
-
-from sqlalchemy import func
 
 from app.database import SessionLocal
 from app.models.document import Document, DocumentTeamVisibility, DocumentVersion
@@ -35,6 +32,11 @@ from app.services.access_control import (
 from app.services.access_requests_service import (
     AccessRequestError,
     request_confidential_access as _request_confidential_access,
+)
+from app.services.document_lookup import (
+    match_documents as _match_documents,
+    resolve_stage as _resolve_stage,
+    resolve_team as _resolve_team,
 )
 from app.services.rag.generation import GenerationError, generate_answer, summarize_full_document
 from app.services.rag.retrieval import NoProjectAccessError, retrieve
@@ -54,27 +56,6 @@ def _stage_name_map(db, project_id: uuid.UUID, stage_ids: set[uuid.UUID]) -> dic
         Stage.project_id == project_id, Stage.stage_id.in_(stage_ids)
     ).all()
     return {s.stage_id: s.name for s in rows}
-
-
-def _resolve_stage(db, project_id: uuid.UUID, stage_ref: str) -> uuid.UUID | None:
-    """Accepts a stage UUID string OR a stage name (case-insensitive). None if unresolvable."""
-    stage_ref = (stage_ref or "").strip()
-    if not stage_ref:
-        return None
-    try:
-        as_uuid = uuid.UUID(stage_ref)
-        exists = db.query(Stage.stage_id).filter(
-            Stage.stage_id == as_uuid, Stage.project_id == project_id, Stage.deleted_at.is_(None)
-        ).first()
-        return as_uuid if exists else None
-    except ValueError:
-        pass
-    row = db.query(Stage).filter(
-        Stage.project_id == project_id,
-        Stage.deleted_at.is_(None),
-        func.lower(Stage.name) == stage_ref.lower(),
-    ).first()
-    return row.stage_id if row else None
 
 
 def _requestable_teams_for_docs(db, user_id: uuid.UUID, document_ids: list[uuid.UUID]) -> list[dict]:
@@ -101,30 +82,12 @@ def _requestable_teams_for_docs(db, user_id: uuid.UUID, document_ids: list[uuid.
     return [{"team_id": str(k), "team_name": v} for k, v in out.items()]
 
 
-def _resolve_team(db, project_id: uuid.UUID, team_ref: str) -> uuid.UUID | None:
-    team_ref = (team_ref or "").strip()
-    if not team_ref:
-        return None
-    try:
-        as_uuid = uuid.UUID(team_ref)
-        exists = db.query(Team.team_id).filter(
-            Team.team_id == as_uuid, Team.project_id == project_id
-        ).first()
-        return as_uuid if exists else None
-    except ValueError:
-        pass
-    row = db.query(Team).filter(
-        Team.project_id == project_id, func.lower(Team.name) == team_ref.lower()
-    ).first()
-    return row.team_id if row else None
-
-
 # ---------------------------------------------------------------------------
 # 1. search_documents — grounded Q&A
 # ---------------------------------------------------------------------------
 
-@tool
-def search_documents(query: str, stage_id: str | None = None) -> dict:
+@tool(stop_after_tool_call=True)
+def search_documents(query: str, stage_id: str | None = None) -> str:
     """
     Answer a question from the project's indexed documents. This is the tool
     for ANY genuine information question ("what does X say", "how do we do Y",
@@ -132,25 +95,64 @@ def search_documents(query: str, stage_id: str | None = None) -> dict:
 
     It retrieves the most relevant approved document chunks the CURRENT USER
     is allowed to see, then generates a cited answer from ONLY those chunks.
-    Every claim in the answer carries a citation naming the source and the
-    stage it came from. It never uses outside knowledge.
+    Every claim carries a citation naming the source and its stage. It never
+    uses outside knowledge.
+
+    The string this returns is already the final, user-ready answer (grounded,
+    cited, or an honest "not found" / an access-request offer). It is shown to
+    the user verbatim — you do NOT rewrite, summarise, or add to it.
 
     Args:
         query: the user's question, in natural language.
         stage_id: OPTIONAL. A stage name (e.g. "Requirements") or stage id to
             restrict the search to that stage and the stages it references.
             Omit to search everything the user can access.
+    """
+    result = _run_search(query, stage_id)
+    status = result["status"]
 
-    Returns a dict with "status":
-        - "answered": {"answer", "sources": [...], "confidential_content_also_present"}
-        - "blocked_by_sensitivity": relevant confidential content exists on a
-          team the user is on, but their clearance doesn't reach it. Carries
-          "requestable_teams" — offer to request access, and if the user
-          agrees call request_confidential_access with that team_id.
-        - "no_results": nothing relevant in the accessible documents. Say so
-          honestly; do NOT guess or offer a near-miss.
-        - "no_project_access": the user has no access to this project at all.
-        - "error": a stage name could not be resolved, or generation failed.
+    if status == "answered":
+        answer = result["answer"]
+        if result.get("confidential_content_also_present"):
+            teams = _team_names(result.get("requestable_teams"))
+            if teams:
+                answer += (
+                    f"\n\n_Some related content is confidential to the {teams} "
+                    f"team and above your clearance — I can request access from "
+                    f"the team lead if you'd like._"
+                )
+        return answer
+
+    if status == "blocked_by_sensitivity":
+        teams = _team_names(result.get("requestable_teams")) or "the owning"
+        return (
+            f"There is relevant content on this, but it is classified confidential "
+            f"to the {teams} team and above your current clearance. Would you like "
+            f"me to request access from the {teams} team lead?"
+        )
+
+    if status == "no_project_access":
+        return "You don't have access to this project."
+
+    if status == "no_results":
+        return (
+            "I couldn't find anything about that in the documents you have access to."
+        )
+
+    # error
+    return result.get("message", "The search could not be completed.")
+
+
+def _team_names(requestable_teams: list[dict] | None) -> str:
+    if not requestable_teams:
+        return ""
+    return ", ".join(t["team_name"] for t in requestable_teams if t.get("team_name"))
+
+
+def _run_search(query: str, stage_id: str | None = None) -> dict:
+    """
+    The retrieval + grounded-generation pipeline. Returns a structured dict
+    (status + payload); search_documents renders it to the final user string.
     """
     ctx = get_rag_context()
     db = SessionLocal()
@@ -344,73 +346,6 @@ def summarize_document(document_reference: str) -> dict:
         }
     finally:
         db.close()
-
-
-_REF_STOPWORDS = {
-    "the", "a", "an", "document", "doc", "file", "of", "for", "about", "please",
-    "whole", "entire", "this", "that", "our", "my", "summary", "overview",
-}
-_DOC_EXT_RE = re.compile(r"\.(md|pdf|docx|doc|txt)$", re.IGNORECASE)
-
-
-def _normalize_ref(s: str) -> str:
-    s = s.lower()
-    for ch in "-_./\\'\"":
-        s = s.replace(ch, " ")
-    return " ".join(s.split())
-
-
-def _match_documents(db, project_id: uuid.UUID, ref: str) -> list[Document]:
-    """
-    Direct Postgres lookup (NOT a vector search) — resolve a free-form
-    reference to document(s) by `original_filename` within the project.
-
-    Matching is done in Python over the project's documents (there are few per
-    project) so it can be forgiving about phrasing:
-      - '-' / '_' / '.' / slashes are treated as spaces, case-insensitive;
-      - a filename extension on either side is ignored;
-      - the reference contains the filename stem, OR the filename contains the
-        reference (so "the company policy handbook document" and
-        "company-policy-handbook.md" both resolve), OR every significant word
-        of the filename appears in the reference.
-
-    Returns the matches (exact-ish first); the caller treats 0 as not-found
-    and >1 as ambiguous.
-    """
-    ref_n = _normalize_ref(ref)
-    ref_stem = _DOC_EXT_RE.sub("", ref_n).strip()
-    if not ref_stem:
-        return []
-    ref_tokens = {t for t in ref_stem.split() if t not in _REF_STOPWORDS and len(t) > 2}
-
-    docs = (
-        db.query(Document)
-        .filter(Document.project_id == project_id)
-        .order_by(Document.created_at.desc())
-        .all()
-    )
-
-    strong: list[Document] = []
-    weak: list[Document] = []
-    for d in docs:
-        fn = _normalize_ref(d.original_filename)
-        stem = _DOC_EXT_RE.sub("", fn).strip()
-        if not stem:
-            continue
-        if ref_stem == stem or ref_stem in fn or stem in ref_n:
-            strong.append(d)
-            continue
-        fn_tokens = {t for t in stem.split() if t not in _REF_STOPWORDS and len(t) > 2}
-        if fn_tokens and fn_tokens <= ref_tokens:
-            weak.append(d)
-
-    chosen = strong or weak
-    seen, unique = set(), []
-    for d in chosen:
-        if d.document_id not in seen:
-            seen.add(d.document_id)
-            unique.append(d)
-    return unique
 
 
 # ---------------------------------------------------------------------------

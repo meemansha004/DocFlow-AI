@@ -8,6 +8,7 @@ from app.routers import (
     admin,
     agents,
     auth,
+    chat,
     document_review,
     documents,
     projects,
@@ -46,6 +47,7 @@ app.include_router(admin.router)
 app.include_router(access_requests.router)
 app.include_router(activity.router)
 app.include_router(agents.router)
+app.include_router(chat.router)
 
 
 @app.get("/health")

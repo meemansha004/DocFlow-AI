@@ -38,6 +38,10 @@ class ChatSession(Base):
     started_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )
+    # Which chat agent owns this conversation: 'rag' (the Search tab) or
+    # 'query' (the Query tab — read-only metadata Q&A). Lets the Search-tab
+    # history sidebar list only its own conversations.
+    mode: Mapped[str] = mapped_column(String(20), nullable=False, default="rag")
 
 
 class ChatMessage(Base):

@@ -71,6 +71,47 @@ def live_request(db: Session, user_id: uuid.UUID, team_id: uuid.UUID) -> AccessR
     return None
 
 
+def pending_requests_for_reviewer(
+    db: Session,
+    *,
+    reviewer_id: uuid.UUID,
+    tenant_id: uuid.UUID,
+    project_id: uuid.UUID | None = None,
+) -> list[AccessRequest]:
+    """
+    Every pending confidential-access request `reviewer_id` is allowed to
+    decide: status == pending, same tenant, and the reviewer passes
+    has_permission(..., "approve_access_request", ...) on that request's team.
+
+    This is the exact query behind GET /access-requests/pending — shared so
+    the Query Agent's list_pending_approvals tool reports precisely what the
+    real Pending Approvals tab shows. Newest first. Optionally narrowed to one
+    project.
+    """
+    from app.services.access_control import has_permission  # avoid import cycle
+
+    rows = db.execute(
+        select(AccessRequest)
+        .where(AccessRequest.status == AccessRequestStatus.pending)
+        .order_by(AccessRequest.requested_at.desc())
+    ).scalars().all()
+
+    out: list[AccessRequest] = []
+    for r in rows:
+        team = db.get(Team, r.team_id)
+        project = db.get(Project, team.project_id) if team else None
+        if team is None or project is None or project.tenant_id != tenant_id:
+            continue
+        if project_id is not None and project.project_id != project_id:
+            continue
+        if not has_permission(
+            db, reviewer_id, "approve_access_request", team.team_id, team.project_id
+        ):
+            continue
+        out.append(r)
+    return out
+
+
 def request_confidential_access(
     db: Session,
     *,
