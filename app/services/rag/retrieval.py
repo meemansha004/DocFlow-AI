@@ -49,7 +49,10 @@ from app.services.rag.reranking import RELEVANCE_FLOOR, rerank_scores
 from app.services.rag.stage_scope import resolve_stage_scope
 
 COARSE_LIMIT = 50
-TOP_K = 6
+# Chunks handed to generation. Kept small on purpose: every chunk is re-sent
+# as prompt context on the generate_answer call, and the cross-encoder rerank
+# above means the top few are almost always where the answer actually is.
+TOP_K = 4
 
 
 class NoProjectAccessError(Exception):

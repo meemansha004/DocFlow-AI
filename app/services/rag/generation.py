@@ -23,12 +23,21 @@ class GenerationError(Exception):
     """Groq returned nothing usable for an answer or a summary."""
 
 
+# gpt-oss models reason before answering, and those hidden reasoning tokens
+# count against the (small) Groq daily budget AND against max_tokens. "low"
+# keeps enough chain-of-thought for a grounded extract/cite task while roughly
+# halving the reasoning overhead. If GROQ_MODEL is ever changed to a model that
+# rejects this value, drop the kwarg here.
+_REASONING_EFFORT = "low"
+
+
 def _complete(messages: list[dict], *, temperature: float, max_tokens: int) -> str:
     response = _client.chat.completions.create(
         model=GROQ_MODEL,
         messages=messages,
         temperature=temperature,
         max_tokens=max_tokens,
+        reasoning_effort=_REASONING_EFFORT,
     )
     content = response.choices[0].message.content
     if not content or not content.strip():
@@ -52,7 +61,7 @@ def generate_answer(question: str, sources: list[dict]) -> str:
     if not sources:
         raise GenerationError("generate_answer called with no sources")
     messages = build_answer_messages(question, sources)
-    return _complete(messages, temperature=0.1, max_tokens=1200)
+    return _complete(messages, temperature=0.1, max_tokens=600)
 
 
 def summarize_full_document(title: str, full_text: str) -> str:
@@ -60,4 +69,4 @@ def summarize_full_document(title: str, full_text: str) -> str:
     if not full_text or not full_text.strip():
         raise GenerationError("summarize_full_document called with empty text")
     messages = build_summary_messages(title, full_text)
-    return _complete(messages, temperature=0.2, max_tokens=900)
+    return _complete(messages, temperature=0.2, max_tokens=700)

@@ -5,7 +5,7 @@ load_dotenv()
 
 DATABASE_URL: str = os.getenv("DATABASE_URL")
 GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
-GROQ_MODEL: str = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+GROQ_MODEL: str = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
 MAX_UPLOAD_SIZE_BYTES: int = int(os.getenv("MAX_UPLOAD_SIZE_BYTES", 10 * 1024 * 1024))
 
 ALLOWED_MIME_TYPES: set[str] = {

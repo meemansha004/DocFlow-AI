@@ -16,7 +16,10 @@ drafting_agent = Agent(
         "itself."
     ),
     debug_mode=False,
-    model=Groq(id=GROQ_MODEL),
+    # Low reasoning for the agent's own calls (tool routing + short replies).
+    # The document generation itself is draft_document's own Groq call, which
+    # keeps full reasoning.
+    model=Groq(id=GROQ_MODEL, request_params={"reasoning_effort": "low"}),
     tools=[draft_document, confirm_draft],
     db=db,
     # No conversation history: every turn is self-contained. The current draft
@@ -25,7 +28,7 @@ drafting_agent = Agent(
     # source of truth by design — replaying old draft bodies through history
     # only bloats the prompt (and blows small-model token limits).
     add_history_to_context=False,
-    retries=2,
+    retries=1,
     exponential_backoff=True,
     instructions="""
 You are a document drafting assistant. You help users draft a document, revise

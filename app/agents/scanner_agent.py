@@ -15,11 +15,15 @@ scanner_agent = Agent(
         "estimating a score or writing document content itself."
     ),
     debug_mode=False,
-    model=Groq(id=GROQ_MODEL),
+    # Low reasoning for the agent's own calls (tool routing + relaying a tool
+    # result). The heavy lifting — the actual rubric judgement — happens inside
+    # score_document's own Groq call, which keeps full reasoning.
+    model=Groq(id=GROQ_MODEL, request_params={"reasoning_effort": "low"}),
     tools=[score_document, reform_document, scan_for_injection],
     db=db,
     add_history_to_context=True,
-    retries=2,
+    num_history_runs=4,
+    retries=1,
     exponential_backoff=True,
     instructions="""
 You are a document quality scanner. Your job is to score documents for
