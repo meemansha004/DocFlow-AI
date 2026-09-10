@@ -15,11 +15,16 @@ drafting_agent = Agent(
         "never inventing document content, confirmations, or save actions "
         "itself."
     ),
-    debug_mode=True,
+    debug_mode=False,
     model=Groq(id=GROQ_MODEL),
     tools=[draft_document, confirm_draft],
     db=db,
-    add_history_to_context=True,
+    # No conversation history: every turn is self-contained. The current draft
+    # is re-injected from the on-disk working file each turn (see
+    # draft_chat.build_context_prefix / draft_workspace), which is the single
+    # source of truth by design — replaying old draft bodies through history
+    # only bloats the prompt (and blows small-model token limits).
+    add_history_to_context=False,
     retries=2,
     exponential_backoff=True,
     instructions="""

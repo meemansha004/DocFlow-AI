@@ -1,7 +1,11 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Bot, User, FileText, Plus, Trash2, MessageSquare, Menu, X } from 'lucide-react';
+import { Bot, User, FileText, Plus, Trash2, MessageSquare, Menu, X, ClipboardCheck, ShieldAlert, ArrowLeft } from 'lucide-react';
 import ChatInput from './ChatInput';
-import { agentsApi, chatApi, ragApi } from '../../lib/api';
+import DocFileCard from '../ui/DocFileCard';
+import MarkdownViewer from '../ui/MarkdownViewer';
+import { agentsApi, chatApi, ragApi, documentReviewApi } from '../../lib/api';
+import { draftTitle } from '../../lib/markdown';
+import { saveBlob } from '../../lib/download';
 
 const SUGGESTIONS = [
   'What are the key requirements in this project?',
@@ -9,13 +13,43 @@ const SUGGESTIONS = [
   'What is still missing or unclear?',
 ];
 
-const ChatPanel = ({ projectId, mode = 'query' }) => {
+const DRAFT_SUGGESTIONS = [
+  'Draft a test plan for the login flow: happy path, wrong password, lockout.',
+  'Draft a short architecture note for a rate limiter.',
+  'Draft a requirements spec for a CSV export feature.',
+];
+
+const newSessionId = () =>
+  (globalThis.crypto?.randomUUID?.() || `sess-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+
+// Builds the seed message shown the moment a document-review session opens —
+// the auto-scan result from the upload, not a blank conversation.
+const buildReviewSeedMessage = (reviewSession) => ({
+  id: 'review-seed',
+  sender: 'bot',
+  text: reviewSession.initialReply || '',
+  reviewScan: true,
+  scan: reviewSession.scan || null,
+  scanError: reviewSession.scanError || null,
+  scanSkipped: !!reviewSession.scanSkipped,
+  reformedContent: reviewSession.reformedContent || null,
+  injectionFlagged: !!reviewSession.injectionFlagged,
+  injectionFindings: reviewSession.injectionFindings || [],
+});
+
+const ChatPanel = ({ projectId, mode = 'query', reviewSession = null, onReviewFinalized, onReviewExit }) => {
+  const isDraft = mode === 'draft';
+  const isReview = mode === 'review';
   const [messages, setMessages] = useState([]);
   const [sessions, setSessions] = useState([]);
   const [sessionId, setSessionId] = useState(null);
+  // Drafting: one session_id per project visit, sent with every message.
+  const [draftSessionId, setDraftSessionId] = useState(newSessionId);
   const [historyLoading, setHistoryLoading] = useState(true);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [isTyping, setIsTyping] = useState(false);
+  // Finalized draft opened in the in-app viewer (Part 1).
+  const [viewerDoc, setViewerDoc] = useState(null);
   const messagesEndRef = useRef(null);
 
   const scrollToBottom = () => {
@@ -27,6 +61,20 @@ const ChatPanel = ({ projectId, mode = 'query' }) => {
   }, [messages, isTyping]);
 
   useEffect(() => {
+    if (isDraft) {
+      // Fresh drafting conversation for this project visit.
+      setDraftSessionId(newSessionId());
+      setMessages([]);
+      setHistoryLoading(false);
+      return undefined;
+    }
+    if (isReview) {
+      // Seeded with the upload's auto-scan result, not blank — the review
+      // session_id itself is the conversation key (one per uploaded document).
+      setMessages(reviewSession ? [buildReviewSeedMessage(reviewSession)] : []);
+      setHistoryLoading(false);
+      return undefined;
+    }
     let cancelled = false;
     setHistoryLoading(true);
     setMessages([]);
@@ -56,7 +104,8 @@ const ChatPanel = ({ projectId, mode = 'query' }) => {
         if (!cancelled) setHistoryLoading(false);
       });
     return () => { cancelled = true; };
-  }, [projectId, mode]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projectId, mode, reviewSession?.sessionId]);
 
   const selectSession = async (id) => {
     setSessionId(id);
@@ -96,6 +145,71 @@ const ChatPanel = ({ projectId, mode = 'query' }) => {
     const userMsg = { id: Date.now().toString(), text, sender: 'user' };
     setMessages((prev) => [...prev, userMsg]);
     setIsTyping(true);
+
+    // --- Drafting flow: real backend, decoupled from persistence ---
+    if (isDraft) {
+      try {
+        const res = await agentsApi.draftMessage(draftSessionId, text);
+        setMessages((prev) => [...prev, {
+          id: `${Date.now()}-bot`,
+          sender: 'bot',
+          text: res.reply || (res.finalized ? 'Draft finalized.' : ''),
+          drafted: !!res.drafted,
+          finalized: !!res.finalized,
+          scan: res.scan || null,
+          scanError: res.scan_error || null,
+          downloadUrl: res.download_url || null,
+          downloadName: res.filename || null,
+          finalContent: res.final_content || null,
+        }]);
+      } catch (err) {
+        setMessages((prev) => [...prev, {
+          id: `${Date.now()}-err`, sender: 'bot', isError: true,
+          text: `The drafting agent hit an error: ${err.message}`,
+        }]);
+      } finally {
+        setIsTyping(false);
+      }
+      return;
+    }
+
+    // --- Document-review flow: revise/finalize an uploaded document ---
+    if (isReview) {
+      if (!reviewSession) {
+        setMessages((prev) => [...prev, {
+          id: `${Date.now()}-err`, sender: 'bot', isError: true,
+          text: 'No document is being reviewed right now.',
+        }]);
+        setIsTyping(false);
+        return;
+      }
+      try {
+        const res = await documentReviewApi.message(reviewSession.documentId, reviewSession.sessionId, text);
+        setMessages((prev) => [...prev, {
+          id: `${Date.now()}-bot`,
+          sender: 'bot',
+          text: res.reply || (res.finalized ? 'Document finalized.' : ''),
+          drafted: !!res.drafted,
+          reviewFinalized: !!res.finalized,
+          versionNumber: res.version_number || null,
+          docStatus: res.status || null,
+          scan: res.scan || null,
+          scanError: res.scan_error || null,
+          reformedContent: res.reformed_content || null,
+          injectionFlagged: !!res.injection_flagged,
+          injectionFindings: res.injection_findings || [],
+        }]);
+        if (res.finalized) onReviewFinalized?.(res);
+      } catch (err) {
+        setMessages((prev) => [...prev, {
+          id: `${Date.now()}-err`, sender: 'bot', isError: true,
+          text: `The document-review agent hit an error: ${err.message}`,
+        }]);
+      } finally {
+        setIsTyping(false);
+      }
+      return;
+    }
 
     try {
       let activeSessionId = sessionId;
@@ -152,9 +266,23 @@ const ChatPanel = ({ projectId, mode = 'query' }) => {
     }
   };
 
+  const handleDownload = async (url, name) => {
+    try {
+      const blob = await agentsApi.draftDownload(url);
+      saveBlob(blob, name || 'draft.md');
+    } catch (err) {
+      setMessages((prev) => [...prev, {
+        id: `${Date.now()}-err`, sender: 'bot', isError: true,
+        text: `Download failed: ${err.message}`,
+      }]);
+    }
+  };
+
+  const suggestions = isDraft ? DRAFT_SUGGESTIONS : SUGGESTIONS;
+
   return (
-    <div className="relative isolate flex flex-col overflow-hidden bg-background">
-      {historyOpen && (
+    <div className="relative isolate flex flex-1 min-h-0 flex-col overflow-hidden bg-background">
+      {!isDraft && !isReview && historyOpen && (
         <button
           type="button"
           aria-label="Close chat history"
@@ -162,7 +290,7 @@ const ChatPanel = ({ projectId, mode = 'query' }) => {
           className="absolute inset-x-0 bottom-0 top-[84px] z-20 cursor-default bg-black/30"
         />
       )}
-      <aside className={`absolute right-0 top-[84px] bottom-0 z-30 flex w-72 max-w-[85%] flex-col border-l border-border bg-surface shadow-2xl transition-transform duration-200 ${historyOpen ? 'translate-x-0' : 'translate-x-full'}`}>
+      <aside hidden={isDraft || isReview} className={`absolute right-0 top-[84px] bottom-0 z-30 flex w-72 max-w-[85%] flex-col border-l border-border bg-surface shadow-2xl transition-transform duration-200 ${historyOpen ? 'translate-x-0' : 'translate-x-full'}`}>
         <div className="flex items-center justify-between border-b border-border/50 p-4">
           <h3 className="text-sm font-semibold text-gray-200">Chat history</h3>
           <button type="button" onClick={() => setHistoryOpen(false)} className="text-gray-400 hover:text-gray-100" aria-label="Close chat history">
@@ -187,14 +315,21 @@ const ChatPanel = ({ projectId, mode = 'query' }) => {
           ))}
         </div>
       </aside>
-      <div className="relative z-40 p-4 border-b border-border/50 bg-surface">
+      <div className="relative z-40 shrink-0 p-4 border-b border-border/50 bg-surface">
         <div className="flex items-center justify-between">
           <h2 className="text-lg font-semibold text-gray-100 flex items-center gap-2">
             <Bot size={20} className="text-primary" />
-            {mode === 'rag' ? 'RAG Retrieval Agent' : 'General Query Agent'}
+            {mode === 'rag' ? 'RAG Retrieval Agent' : 'Chat Interface'}
           </h2>
-          <div className="flex items-center gap-3">
-            <span className="text-[10px] uppercase tracking-widest text-primary font-bold">Live</span>
+          {isReview ? (
+            <button
+              type="button"
+              onClick={() => onReviewExit?.()}
+              className="inline-flex items-center gap-1.5 rounded-full border border-border bg-background px-2.5 py-1 text-xs font-medium text-gray-300 hover:border-primary/50 hover:text-gray-100 transition-colors"
+            >
+              <ArrowLeft size={13} /> Back to drafting
+            </button>
+          ) : !isDraft && (
             <button
               type="button"
               onClick={() => setHistoryOpen((open) => !open)}
@@ -205,22 +340,28 @@ const ChatPanel = ({ projectId, mode = 'query' }) => {
             >
               {historyOpen ? <X size={21} /> : <Menu size={21} />}
             </button>
-          </div>
+          )}
         </div>
         <p className="text-sm text-gray-400 mt-1">
           {mode === 'rag'
             ? 'Search your authorized project knowledge base and inspect the matching source chunks.'
-            : 'Gemini scans every stage, document, gap, and workflow item in this project to answer your request.'}
+            : isReview
+              ? `Reviewing "${reviewSession?.originalFilename || 'uploaded document'}" — ${reviewSession?.stageName || ''}. Revise here, then finalize to write a new version and index it.`
+              : isDraft
+                ? 'Draft a document with the AI, revise it, then finalize to download. Separate from project uploads.'
+                : 'Ask questions about this project.'}
         </p>
       </div>
 
-      <div className="p-4 space-y-6">
+      <div className="flex-1 min-h-0 overflow-y-auto p-4 space-y-6">
         {messages.length === 0 ? (
           <div className="h-full flex flex-col items-center justify-center text-center max-w-md mx-auto">
             <Bot size={48} className="text-primary/20 mb-4" />
-            <h3 className="text-gray-200 font-medium mb-6">How can I help you today?</h3>
+            <h3 className="text-gray-200 font-medium mb-6">
+              {isDraft ? 'What would you like to draft?' : 'How can I help you today?'}
+            </h3>
             <div className="flex flex-col gap-2 w-full">
-              {SUGGESTIONS.map((suggestion, idx) => (
+              {suggestions.map((suggestion, idx) => (
                 <button
                   key={idx}
                   onClick={() => handleSend(suggestion)}
@@ -261,6 +402,108 @@ const ChatPanel = ({ projectId, mode = 'query' }) => {
                       ))}
                     </div>
                   )}
+                  {msg.finalized && (
+                    <div className="mt-3 pt-3 border-t border-border/50 space-y-2">
+                      {msg.scan ? (
+                        <div className="rounded-lg border border-border bg-background p-3">
+                          <p className="text-xs font-semibold text-gray-200 flex items-center gap-1.5">
+                            <ClipboardCheck size={13} className="text-primary" />
+                            Structure Scanner — {msg.scan.overall_score}/60
+                          </p>
+                          <ul className="mt-1.5 space-y-0.5">
+                            {(msg.scan.criteria || []).map((cc) => (
+                              <li key={cc.name} className="text-xs text-gray-500">
+                                {cc.name.replace(/_/g, ' ')}: <span className="text-gray-300">{cc.score}/20</span>
+                                {cc.note ? ` — ${cc.note}` : ''}
+                              </li>
+                            ))}
+                          </ul>
+                          {msg.scan.summary && <p className="mt-1.5 text-xs text-gray-400">{msg.scan.summary}</p>}
+                        </div>
+                      ) : (
+                        <p className="text-xs text-amber-400">
+                          Structure Scanner could not run: {msg.scanError || 'unknown error'} (the draft was still saved).
+                        </p>
+                      )}
+                      {msg.finalContent && (
+                        <DocFileCard
+                          title={draftTitle({ content: msg.finalContent, filename: msg.downloadName })}
+                          meta="Document · MD"
+                          onOpen={() => setViewerDoc({
+                            title: draftTitle({ content: msg.finalContent, filename: msg.downloadName }),
+                            subtitle: msg.downloadName,
+                            content: msg.finalContent,
+                            downloadUrl: msg.downloadUrl,
+                            downloadName: msg.downloadName,
+                          })}
+                          onDownload={msg.downloadUrl
+                            ? () => handleDownload(msg.downloadUrl, msg.downloadName)
+                            : undefined}
+                        />
+                      )}
+                      <p className="text-[11px] text-gray-600">
+                        Local file only — not uploaded to any project, stage, or team.
+                      </p>
+                    </div>
+                  )}
+                  {(msg.reviewScan || msg.reviewFinalized) && (
+                    <div className="mt-3 pt-3 border-t border-border/50 space-y-2">
+                      {msg.reviewFinalized && (
+                        <p className="text-xs font-semibold text-gray-200">
+                          New version{msg.versionNumber ? ` ${msg.versionNumber}` : ''} saved — status:{' '}
+                          <span className={msg.docStatus === 'indexed' ? 'text-emerald-400' : 'text-amber-400'}>
+                            {msg.docStatus || 'pending_review'}
+                          </span>
+                        </p>
+                      )}
+                      {msg.scan ? (
+                        <div className="rounded-lg border border-border bg-background p-3">
+                          <p className="text-xs font-semibold text-gray-200 flex items-center gap-1.5">
+                            <ClipboardCheck size={13} className="text-primary" />
+                            Structure Scanner — {msg.scan.overall_score}/60
+                            {msg.scanSkipped && <span className="text-[10px] font-normal text-gray-500">(reused, not re-scanned)</span>}
+                          </p>
+                          {(msg.scan.criteria || []).length > 0 && (
+                            <ul className="mt-1.5 space-y-0.5">
+                              {msg.scan.criteria.map((cc) => (
+                                <li key={cc.name} className="text-xs text-gray-500">
+                                  {cc.name.replace(/_/g, ' ')}: <span className="text-gray-300">{cc.score}/20</span>
+                                  {cc.note ? ` — ${cc.note}` : ''}
+                                </li>
+                              ))}
+                            </ul>
+                          )}
+                          {msg.scan.summary && <p className="mt-1.5 text-xs text-gray-400">{msg.scan.summary}</p>}
+                        </div>
+                      ) : msg.scanError && (
+                        <p className="text-xs text-amber-400">
+                          Structure Scanner could not run: {msg.scanError}
+                        </p>
+                      )}
+                      {msg.reformedContent && (
+                        <p className="text-xs text-gray-400">
+                          A suggested reform is available — ask to see or apply it if you'd like.
+                        </p>
+                      )}
+                      {msg.injectionFlagged && (
+                        <div className="rounded-lg border border-red-500/30 bg-red-500/10 p-3">
+                          <p className="text-xs font-semibold text-red-300 flex items-center gap-1.5">
+                            <ShieldAlert size={13} /> Injection Scanner flagged this document
+                          </p>
+                          <ul className="mt-1.5 space-y-0.5">
+                            {msg.injectionFindings.slice(0, 5).map((f, idx) => (
+                              <li key={idx} className="text-xs text-red-300/80">
+                                {f.reason}: <span className="italic">&ldquo;{f.excerpt}&rdquo;</span>
+                              </li>
+                            ))}
+                          </ul>
+                          <p className="mt-1.5 text-[11px] text-red-300/70">
+                            Held for human review — it will not be indexed until this is cleared.
+                          </p>
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </div>
               </div>
             ))}
@@ -282,6 +525,17 @@ const ChatPanel = ({ projectId, mode = 'query' }) => {
       </div>
 
       <ChatInput onSend={handleSend} disabled={isTyping} />
+
+      <MarkdownViewer
+        open={Boolean(viewerDoc)}
+        onClose={() => setViewerDoc(null)}
+        title={viewerDoc?.title}
+        subtitle={viewerDoc?.subtitle}
+        content={viewerDoc?.content || ''}
+        onDownload={viewerDoc?.downloadUrl
+          ? () => handleDownload(viewerDoc.downloadUrl, viewerDoc.downloadName)
+          : undefined}
+      />
     </div>
   );
 };

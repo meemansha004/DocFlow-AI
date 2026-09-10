@@ -1,13 +1,16 @@
 import React, { useEffect, useState, useCallback } from 'react';
 import { useParams, Link } from 'react-router-dom';
-import { ArrowLeft, Search as SearchIcon, UploadCloud, MessageSquare, ShieldCheck, Lock } from 'lucide-react';
+import { ArrowLeft, Lock, PanelRight } from 'lucide-react';
 import SourcePanel from '../components/sources/SourcePanel';
 import ChatPanel from '../components/chat/ChatPanel';
 import StudioPanel from '../components/studio/StudioPanel';
 import Badge from '../components/ui/Badge';
 import Modal from '../components/ui/Modal';
 import Button from '../components/ui/Button';
-import { projectsApi, agentsApi, workspaceApi, accessRequestsApi } from '../lib/api';
+import Input from '../components/ui/Input';
+import MarkdownViewer from '../components/ui/MarkdownViewer';
+import { draftTitle } from '../lib/markdown';
+import { projectsApi, workspaceApi, accessRequestsApi, teamsApi } from '../lib/api';
 import { useAuth } from '../context/AuthContext';
 
 const ProjectWorkspace = () => {
@@ -17,11 +20,19 @@ const ProjectWorkspace = () => {
   const [documents, setDocuments] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
-  const [memberSearch, setMemberSearch] = useState('');
 
-  const [gapReport, setGapReport] = useState(null);
-  const [gapLoading, setGapLoading] = useState(false);
-  const [gapOpen, setGapOpen] = useState(false);
+  // Document-review session — set the moment "Upload Doc" succeeds, switches
+  // the center ChatPanel into review mode (seeded with the auto-scan result,
+  // not a blank drafting conversation). Cleared on "Back to drafting" or
+  // uploading a different document.
+  const [reviewSession, setReviewSession] = useState(null);
+
+  // Studio side panel (Part 2) — hidden by default, opened from the toolbar.
+  const [studioOpen, setStudioOpen] = useState(false);
+  // A scratch/working template uploaded into Studio — client-side only, kept
+  // for this project visit, never persisted.
+  const [scratchTemplate, setScratchTemplate] = useState(null);
+  const [studioViewerDoc, setStudioViewerDoc] = useState(null);
 
   // Confidential-access requests (viewer/contributor entry point)
   const [wsProject, setWsProject] = useState(null); // this project's teams + my per-team role
@@ -30,6 +41,14 @@ const ProjectWorkspace = () => {
   const [reqBusy, setReqBusy] = useState(null); // team_id in flight
   const [reqNotice, setReqNotice] = useState('');
   const [reqError, setReqError] = useState('');
+
+  // Teams modal — manage the teams that exist in this project (not user assignment)
+  const [teamsOpen, setTeamsOpen] = useState(false);
+  const [teams, setTeams] = useState([]);
+  const [teamsLoading, setTeamsLoading] = useState(false);
+  const [newTeamName, setNewTeamName] = useState('');
+  const [creatingTeam, setCreatingTeam] = useState(false);
+  const [teamError, setTeamError] = useState('');
 
   const load = useCallback(async ({ silent = false } = {}) => {
     if (!silent) setLoading(true);
@@ -55,19 +74,6 @@ const ProjectWorkspace = () => {
   useEffect(() => {
     load();
   }, [load]);
-
-  const handleAnalyzeGaps = async () => {
-    setGapOpen(true);
-    setGapLoading(true);
-    try {
-      const result = await agentsApi.analyzeGaps(projectId);
-      setGapReport(result);
-    } catch (err) {
-      setGapReport({ gap_report: `Could not analyze gaps: ${err.message}` });
-    } finally {
-      setGapLoading(false);
-    }
-  };
 
   // Teams in this project where I'm viewer/contributor — i.e. not auto-cleared for confidential docs.
   const requestableTeams = (wsProject?.teams || []).filter(
@@ -100,21 +106,65 @@ const ProjectWorkspace = () => {
   // Our model: team_lead+ or project_admin can review (the backend still checks
   // the document's *specific* team and returns a clear 403 otherwise).
   const canReview = ['org_admin', 'project_admin', 'team_lead'].includes(role);
-  const canManageAccess = ['org_admin', 'project_admin', 'team_lead'].includes(role);
   const canManageStages = ['org_admin', 'project_admin'].includes(role);
-  const pendingCount = documents.filter((document) => document.workflow_state === 'pending_review').length;
-  const approvedCount = documents.filter((document) => document.workflow_state === 'approved').length;
-  const memberNames = project?.members?.map((member) => member.name || member.username).filter(Boolean) || [];
-  const matchingMembers = project?.members?.filter((member) => {
-    const query = memberSearch.trim().toLowerCase();
-    if (!query) return false;
-    return [member.name, member.username, member.team_name, member.role]
-      .filter(Boolean)
-      .some((value) => value.toLowerCase().includes(query));
-  }) || [];
-  const memberSearchPlaceholder = memberNames.length
-    ? `Search members: ${memberNames.slice(0, 2).join(', ')}${memberNames.length > 2 ? ', ...' : ''}`
-    : 'Search project members';
+  const canManageTeams = ['org_admin', 'project_admin'].includes(role);
+
+  const teamNames = (wsProject?.teams || []).map((t) => t.name);
+
+  const openTeams = async () => {
+    setTeamsOpen(true);
+    setTeamError('');
+    setNewTeamName('');
+    setTeamsLoading(true);
+    try {
+      setTeams(await teamsApi.list(projectId));
+    } catch (err) {
+      setTeamError(err.message || 'Could not load teams.');
+    } finally {
+      setTeamsLoading(false);
+    }
+  };
+
+  const handleCreateTeam = async () => {
+    const name = newTeamName.trim();
+    if (!name) return;
+    setCreatingTeam(true);
+    setTeamError('');
+    try {
+      await teamsApi.create(projectId, name);
+      setNewTeamName('');
+      setTeams(await teamsApi.list(projectId));
+      await load({ silent: true }); // refresh the toolbar label + workspace teams
+    } catch (err) {
+      setTeamError(err.message || 'Could not create the team.');
+    } finally {
+      setCreatingTeam(false);
+    }
+  };
+
+  // "Upload Doc" succeeded (SourcePanel) — switch the chat panel into review
+  // mode, seeded with the upload response's auto-scan result.
+  const handleDocumentUploaded = (result) => {
+    setReviewSession({
+      documentId: result.document_id,
+      sessionId: result.session_id,
+      stageName: result.stage_name,
+      originalFilename: result.originalFilename,
+      initialReply: result.reply,
+      scan: result.scan,
+      scanError: result.scan_error,
+      scanSkipped: result.scan_skipped,
+      reformedContent: result.reformed_content,
+      injectionFlagged: result.injection_flagged,
+      injectionFindings: result.injection_findings,
+    });
+  };
+
+  // A review turn finalized (new DocumentVersion written) — refresh the
+  // Sources panel so document counts / any status the UI shows stay current.
+  const handleReviewFinalized = () => {
+    load({ silent: true });
+  };
 
   if (loading) {
     return (
@@ -144,47 +194,18 @@ const ProjectWorkspace = () => {
         </Link>
         <div className="w-px h-4 bg-border"></div>
         <h1 className="font-semibold text-gray-100">{project.project_name}</h1>
-        {project.assigned_teams?.length > 0 && (
-          <Badge variant="neutral">Team: {project.assigned_teams.join(', ')}</Badge>
-        )}
-        <Badge variant="active">{documents.length} doc{documents.length === 1 ? '' : 's'}</Badge>
-        <div className="hidden xl:flex items-center gap-2">
-          <Badge variant="success">{approvedCount} approved</Badge>
-          {pendingCount > 0 && <Badge variant="warning">{pendingCount} pending review</Badge>}
-        </div>
-        <div className="relative w-40 sm:w-52 shrink-0">
-          <SearchIcon size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-500" />
-          <input
-            type="search"
-            value={memberSearch}
-            onChange={(event) => setMemberSearch(event.target.value)}
-            placeholder={memberSearchPlaceholder}
-            aria-label="Search project members"
-            className="w-full rounded-lg border border-border bg-surface py-2 pl-9 pr-3 text-xs text-gray-200 placeholder:text-gray-600 focus:border-primary focus:outline-none"
-          />
-          {memberSearch.trim() && (
-            <div className="absolute right-0 top-full z-20 mt-2 w-72 rounded-lg border border-border bg-surface p-2 shadow-xl">
-              {matchingMembers.length > 0 ? matchingMembers.map((member) => (
-                <div key={member.user_id} className="rounded-md px-3 py-2 hover:bg-background">
-                  <p className="text-sm text-gray-200">{member.name || member.username}</p>
-                  <p className="text-xs text-gray-500 mt-0.5">
-                    {member.role || 'Member'}{member.team_name ? ` · ${member.team_name}` : ''}
-                  </p>
-                </div>
-              )) : (
-                <p className="px-3 py-2 text-xs text-gray-500">No project members found.</p>
-              )}
-            </div>
-          )}
-        </div>
+        <button
+          type="button"
+          onClick={openTeams}
+          title="Teams in this project"
+          className="inline-flex items-center gap-1.5 rounded-full border border-border bg-surface px-2.5 py-1 text-xs font-medium text-gray-300 hover:border-primary/50 hover:text-gray-100 transition-colors shrink-0"
+        >
+          Teams
+          <span className="text-gray-500 max-w-[220px] truncate">
+            {teamNames.length ? teamNames.join(', ') : '—'}
+          </span>
+        </button>
         <div className="flex-1" />
-        {canManageAccess && (
-          <Link to={`/admin?project_id=${encodeURIComponent(projectId)}`}>
-            <Button size="sm" variant="secondary" icon={ShieldCheck}>
-              {role === 'team_lead' && !user?.is_org_admin ? 'Manage team' : 'Manage access'}
-            </Button>
-          </Link>
-        )}
         {requestableTeams.length > 0 && (
           <Button
             size="sm"
@@ -195,21 +216,21 @@ const ProjectWorkspace = () => {
             Confidential access
           </Button>
         )}
-        <Link to={`/projects/${projectId}/upload`}>
-          <Button size="sm" variant="secondary" icon={UploadCloud}>Add sources</Button>
-        </Link>
-        <Link to={`/studio/query?project_id=${encodeURIComponent(projectId)}`}>
-         <Button size="sm" variant="secondary" icon={MessageSquare}>Open Query Agent</Button>
-        </Link>
-        <Button size="sm" variant="secondary" icon={SearchIcon} onClick={handleAnalyzeGaps}>
-          Analyze Gaps
+        <Button
+          size="sm"
+          variant={studioOpen ? 'primary' : 'secondary'}
+          icon={PanelRight}
+          onClick={() => setStudioOpen((v) => !v)}
+        >
+          Studio
         </Button>
       </div>
 
-      {/* 3-Column Layout — each column scrolls inside its own fixed-height pane.
-          Below lg the whole row scrolls as one stacked column. */}
-      <div className="flex-1 min-h-0 flex flex-col lg:flex-row overflow-y-auto lg:overflow-hidden">
-        <div className="w-full lg:w-[30%] shrink-0 lg:h-full lg:min-h-0 lg:overflow-y-auto">
+      {/* Two-column layout (Sources + Chat Interface). Studio is a toggleable
+          overlay panel, not a permanent column. Each column scrolls inside its
+          own fixed-height pane; below lg the row scrolls as one stack. */}
+      <div className="relative flex-1 min-h-0 flex flex-col lg:flex-row overflow-y-auto lg:overflow-hidden">
+        <div className="w-full lg:w-[32%] shrink-0 lg:h-full lg:min-h-0 lg:overflow-y-auto">
           <SourcePanel
             documents={documents}
             canReview={canReview}
@@ -220,15 +241,109 @@ const ProjectWorkspace = () => {
             teams={wsProject?.teams || []}
             canManageStages={canManageStages}
             onStagesChanged={() => load({ silent: true })}
+            onDocumentUploaded={handleDocumentUploaded}
           />
         </div>
-        <div className="w-full lg:w-[40%] shrink-0 lg:h-full lg:min-h-0 lg:overflow-y-auto border-t border-border lg:border-t-0">
-          <ChatPanel projectId={projectId} />
+        {/* Center pane: header + scrolling message area + input pinned to the
+            bottom. The column is height-boxed so ChatPanel manages its own
+            internal scroll and the input never scrolls away. Switches into
+            document-review mode the moment an upload succeeds. */}
+        <div className="w-full lg:flex-1 shrink-0 flex flex-col h-[70vh] lg:h-full lg:min-h-0 overflow-hidden border-t border-border lg:border-t-0 lg:border-l">
+          <ChatPanel
+            projectId={projectId}
+            mode={reviewSession ? 'review' : 'draft'}
+            reviewSession={reviewSession}
+            onReviewFinalized={handleReviewFinalized}
+            onReviewExit={() => setReviewSession(null)}
+          />
         </div>
-        <div className="w-full lg:w-[30%] shrink-0 lg:h-full lg:min-h-0 lg:overflow-y-auto border-t border-border lg:border-t-0">
-          <StudioPanel projectId={projectId} onAnalyzeGaps={handleAnalyzeGaps} />
-        </div>
+
+        {/* Studio — toggleable panel (Claude artifact-panel pattern): an in-flow
+            column on lg that shrinks the chat; a fixed overlay drawer on mobile. */}
+        {studioOpen && (
+          <>
+            <button
+              type="button"
+              aria-label="Close Studio"
+              onClick={() => setStudioOpen(false)}
+              className="fixed inset-x-0 bottom-0 top-14 z-30 bg-background/50 lg:hidden"
+            />
+            <div className="fixed top-14 bottom-0 right-0 z-40 w-full max-w-md border-l border-border shadow-2xl lg:static lg:top-0 lg:z-auto lg:h-full lg:w-[380px] lg:max-w-none lg:shadow-none shrink-0">
+              <StudioPanel
+                projectId={projectId}
+                onClose={() => setStudioOpen(false)}
+                scratchTemplate={scratchTemplate}
+                onScratchUpload={setScratchTemplate}
+                onScratchClear={() => setScratchTemplate(null)}
+                onScratchView={(tpl) => setStudioViewerDoc({
+                  title: draftTitle({ content: tpl.content, filename: tpl.name }),
+                  subtitle: `${tpl.name} · working template`,
+                  content: tpl.content,
+                })}
+              />
+            </div>
+          </>
+        )}
       </div>
+
+      <MarkdownViewer
+        open={Boolean(studioViewerDoc)}
+        onClose={() => setStudioViewerDoc(null)}
+        title={studioViewerDoc?.title}
+        subtitle={studioViewerDoc?.subtitle}
+        content={studioViewerDoc?.content || ''}
+      />
+
+      <Modal
+        open={teamsOpen}
+        onClose={() => setTeamsOpen(false)}
+        title="Teams"
+        description="The teams that exist in this project. (To add people to a team, use Assign Roles.)"
+        footer={<Button variant="ghost" onClick={() => setTeamsOpen(false)}>Close</Button>}
+      >
+        <div className="space-y-4">
+          {teamError && <p className="text-sm text-red-400">{teamError}</p>}
+
+          {teamsLoading ? (
+            <p className="text-sm text-gray-500">Loading teams…</p>
+          ) : (
+            <div className="space-y-2">
+              {teams.length === 0 && <p className="text-sm text-gray-500">This project has no teams yet.</p>}
+              {teams.map((t) => (
+                <div key={t.team_id} className="flex items-center justify-between rounded-lg border border-border bg-background px-3 py-2.5">
+                  <span className="text-sm text-gray-200">{t.name}</span>
+                  <span className="text-xs text-gray-500">
+                    {t.member_count} member{t.member_count === 1 ? '' : 's'}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {canManageTeams && (
+            <form
+              onSubmit={(e) => { e.preventDefault(); handleCreateTeam(); }}
+              className="border-t border-border/60 pt-4 space-y-2"
+            >
+              <p className="text-xs font-semibold uppercase tracking-wider text-gray-500">Create new team</p>
+              <div className="flex items-end gap-2">
+                <Input
+                  label="Team name"
+                  value={newTeamName}
+                  onChange={(e) => setNewTeamName(e.target.value)}
+                  placeholder="e.g. QA"
+                />
+                <Button type="submit" loading={creatingTeam} disabled={!newTeamName.trim()}>
+                  Create team
+                </Button>
+              </div>
+              <p className="text-xs text-gray-500">
+                New teams are immediately available in the Assign Roles team dropdown.
+              </p>
+            </form>
+          )}
+        </div>
+      </Modal>
 
       <Modal
         open={accessOpen}
@@ -267,23 +382,6 @@ const ProjectWorkspace = () => {
             );
           })}
         </div>
-      </Modal>
-
-      <Modal
-        open={gapOpen}
-        onClose={() => setGapOpen(false)}
-        title="Documentation Gap Analysis"
-        description="Gap-Detection Agent — compares uploaded documents against expected SDLC stage coverage."
-      >
-        {gapLoading ? (
-          <div className="flex justify-center py-8">
-            <div className="w-6 h-6 border-4 border-primary/30 border-t-primary rounded-full animate-spin" />
-          </div>
-        ) : (
-          <div className="text-sm text-gray-300 whitespace-pre-wrap max-h-[50vh] overflow-y-auto">
-            {gapReport?.gap_report}
-          </div>
-        )}
       </Modal>
     </div>
   );

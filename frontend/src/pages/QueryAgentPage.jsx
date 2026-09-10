@@ -9,15 +9,15 @@ const QueryAgentPage = () => {
   const mode = searchParams.get('agent') === 'rag' ? 'rag' : 'query';
 
   return (
-    <div className="flex-1 flex flex-col bg-background">
+    <div className="flex flex-col h-[calc(100vh-3.5rem)] overflow-hidden bg-background">
       <div className="h-14 border-b border-border bg-background px-6 flex items-center shrink-0">
         <Link to={projectId ? `/projects/${encodeURIComponent(projectId)}` : '/studio'} className="text-gray-400 hover:text-gray-200 transition-colors flex items-center gap-1 text-sm">
           <ArrowLeft size={16} />
           {projectId ? 'Back to Project' : 'Back to Studio'}
         </Link>
       </div>
-      <div className="flex-1 max-w-4xl w-full mx-auto border-x border-border">
-      <ChatPanel projectId={projectId} mode={mode} />
+      <div className="flex-1 min-h-0 max-w-4xl w-full mx-auto border-x border-border flex flex-col">
+        <ChatPanel projectId={projectId} mode={mode} />
       </div>
     </div>
   );

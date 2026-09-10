@@ -8,10 +8,17 @@ draft": it is inspectable mid-conversation, and it is the exact bytes that get
 scanned and saved when the user finalizes. The LLM never carries draft content
 through a tool argument.
 
+Concurrency: every function takes `session_id` EXPLICITLY. There is no
+module-level "current session" — the CLI has one session, the HTTP server has
+one per request, and two of them touching this module at the same time must
+never see each other's working file.
+
 Still fully decoupled from persistence (MERGE_DECISIONS §4): no DB, no ABAC,
 no stage / team / project.
 """
 
+import hashlib
+import re
 from pathlib import Path
 
 from app.services.draft_export import DRAFTS_DIR, save_draft
@@ -19,54 +26,104 @@ from app.services.scan_score import ScoringError, score_document
 
 WIP_DIR = DRAFTS_DIR / ".wip"
 
-_current_session_id: str | None = None
+# Hidden marker embedded at the top of a chat-finalized file (see
+# embed_scan_marker / check_scan_marker below) — lets the upload flow
+# (app/services/document_upload_review.py) recognize a chat-drafted file
+# re-uploaded UNCHANGED and skip re-running the (paid, LLM-backed) structural
+# scan, reusing the score already computed when it was finalized here.
+_SCAN_MARKER_RE = re.compile(
+    r"^<!--\s*docflow-scan:\s*score=(\d+)/60;\s*content-hash=([0-9a-f]{64})\s*-->\n?",
+    re.IGNORECASE,
+)
 
 
-def set_session(session_id: str) -> None:
-    """Bind the workspace to a chat session. Call once at CLI startup."""
-    global _current_session_id
-    _current_session_id = session_id
+def _wip_path(session_id: str) -> Path:
+    if not session_id:
+        raise ValueError("session_id is required")
+    # Guard against a session_id that would escape the .wip directory.
+    name = Path(str(session_id)).name
+    if name != str(session_id) or not name:
+        raise ValueError(f"Invalid session_id: {session_id!r}")
+    return WIP_DIR / f"{name}.md"
 
 
-def _wip_path() -> Path:
-    if not _current_session_id:
-        raise RuntimeError("draft_workspace.set_session() has not been called")
-    return WIP_DIR / f"{_current_session_id}.md"
-
-
-def write_working_draft(content: str) -> str:
-    """Overwrite the working file with the latest draft. Returns its path."""
+def write_working_draft(session_id: str, content: str) -> str:
+    """Overwrite the session's working file with the latest draft. Returns its path."""
     WIP_DIR.mkdir(parents=True, exist_ok=True)
-    path = _wip_path()
-    path.write_text(content, encoding="utf-8")
+    path = _wip_path(session_id)
+    # write_bytes / read_bytes (not write_text): keep the draft's bytes exact
+    # across the round-trip — no platform newline translation — so the
+    # finalized file, the scanned content, and what the user was shown all match.
+    path.write_bytes(content.encode("utf-8"))
     return str(path)
 
 
-def read_working_draft() -> str | None:
-    """Current draft text from disk, or None if no working file exists yet."""
-    path = _wip_path()
-    return path.read_text(encoding="utf-8") if path.exists() else None
+def read_working_draft(session_id: str) -> str | None:
+    """Current draft text from disk for this session, or None if none exists yet."""
+    path = _wip_path(session_id)
+    return path.read_bytes().decode("utf-8") if path.exists() else None
 
 
-def has_working_draft() -> bool:
-    return _wip_path().exists()
+def has_working_draft(session_id: str) -> bool:
+    return _wip_path(session_id).exists()
 
 
-def finalize() -> dict:
+def delete_working_draft(session_id: str) -> None:
+    """Remove the session's working file, if it exists. Idempotent."""
+    path = _wip_path(session_id)
+    if path.exists():
+        path.unlink()
+
+
+def embed_scan_marker(content: str, score: int) -> str:
     """
-    Finalize the conversation's draft:
+    Prepends a hidden HTML-comment marker recording the score and a SHA-256
+    of `content` (computed BEFORE the marker is added, i.e. of the content
+    "below" it). Invisible in any rendered Markdown viewer.
+    """
+    content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    return f"<!-- docflow-scan: score={score}/60; content-hash={content_hash} -->\n{content}"
+
+
+def check_scan_marker(content: str) -> dict | None:
+    """
+    If `content` starts with a docflow-scan marker AND a fresh SHA-256 of the
+    content below it matches the embedded hash (i.e. nothing was edited since
+    it was finalized here), returns {"score": int, "content_without_marker":
+    str}. Otherwise (no marker, or a hash mismatch meaning the content WAS
+    edited after download) returns None — the caller should scan fresh.
+    """
+    match = _SCAN_MARKER_RE.match(content)
+    if not match:
+        return None
+    score = int(match.group(1))
+    embedded_hash = match.group(2)
+    remainder = content[match.end():]
+    if hashlib.sha256(remainder.encode("utf-8")).hexdigest() != embedded_hash:
+        return None
+    return {"score": score, "content_without_marker": remainder}
+
+
+def finalize(session_id: str) -> dict:
+    """
+    Finalize this session's draft:
       1. read the working file (the real, final draft — nothing the LLM could
          have substituted),
       2. score it via score_document(),
-      3. save it into drafts/ with draft_export's slug+timestamp name,
-      4. delete the working file.
+      3. on a successful score, prepend a hidden scan-result marker (see
+         embed_scan_marker) — lets a later re-upload of this exact file skip
+         re-scanning (see check_scan_marker / document_upload_review.py),
+      4. save it into drafts/ with draft_export's slug+timestamp name,
+      5. delete the working file.
 
-    Returns {"scan", "scan_error", "path", "content"}.
+    Returns {"scan", "scan_error", "path", "content"} — "content" is the
+    EXACT bytes written to disk (marker included when a score exists), since
+    that's what's scanned, shown to the user, and downloaded.
     """
-    path = _wip_path()
+    path = _wip_path(session_id)
     if not path.exists():
         raise RuntimeError("No working draft to finalize")
-    content = path.read_text(encoding="utf-8")
+    content = path.read_bytes().decode("utf-8")
 
     scan: dict | None = None
     scan_error: str | None = None
@@ -77,7 +134,8 @@ def finalize() -> dict:
     except Exception as exc:  # network / rate-limit / etc — saving must not fail
         scan_error = f"{type(exc).__name__}: {exc}"
 
-    final_path = save_draft(content)
-    path.unlink()
+    content_to_save = embed_scan_marker(content, scan["overall_score"]) if scan else content
+    final_path = save_draft(content_to_save)
+    delete_working_draft(session_id)
 
-    return {"scan": scan, "scan_error": scan_error, "path": final_path, "content": content}
+    return {"scan": scan, "scan_error": scan_error, "path": final_path, "content": content_to_save}

@@ -14,7 +14,7 @@ const ChatInput = ({ onSend, disabled }) => {
   };
 
   return (
-    <form onSubmit={handleSubmit} className="p-4 border-t border-border/50 bg-background/50">
+    <form onSubmit={handleSubmit} className="shrink-0 p-4 border-t border-border/50 bg-background/50">
       <div className="relative flex items-center">
         <input
           type="text"

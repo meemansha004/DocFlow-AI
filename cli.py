@@ -22,66 +22,28 @@ from app.database import SessionLocal
 from app.services.session_startup import select_current_user
 from app.services.session_context import set_current_session
 from app.services import draft_workspace
+from app.services.draft_chat import run_draft_turn
 
-from app.agents.drafting_agent import drafting_agent
 from app.agents.scanner_agent import scanner_agent
 
 COMMANDS = ("/draft", "/scan", "/rag", "/query")
 
 
-def _get_tool_result(response, tool_name: str):
-    if not response.tools:
-        return None
-    match = next((t for t in response.tools if t.tool_name == tool_name), None)
-    return match.result if match else None
-
-
-def _was_tool_called(response, tool_name: str) -> bool:
-    return _get_tool_result(response, tool_name) is not None
-
-
-def _finalize_from_disk() -> None:
-    """
-    Runs after the Drafting Agent calls confirm_draft. Deterministic: reads the
-    working file, scores it, moves it into drafts/, deletes the working file.
-    The draft content comes straight from disk — the LLM never carries it.
-    """
-    if not draft_workspace.has_working_draft():
-        print("\n(Nothing to finalize — no draft exists yet.)")
-        return
-
-    outcome = draft_workspace.finalize()
-    scan = outcome["scan"]
+def _print_finalize(turn: dict) -> None:
+    """Format the shared run_draft_turn() finalize result for the terminal."""
+    scan = turn["scan"]
     if scan is None:
-        print(f"\nStructure Scanner could not complete: {outcome['scan_error']}")
+        print(f"\nStructure Scanner could not complete: {turn['scan_error']}")
     else:
         print(f"\nStructure Scanner: {scan['overall_score']}/60")
         for criterion in scan["criteria"]:
             print(f"  - {criterion['name']}: {criterion['score']}/20 — {criterion['note']}")
         print(f"  Summary: {scan['summary']}")
 
-    print(f"\nFinished draft saved to: {outcome['path']}")
+    print(f"\nFinished draft saved to: {turn['path']}")
     print(
         "(Local file only — not uploaded to any project, stage, or team. "
         "Use the app's Upload feature for that.)"
-    )
-
-
-def _build_context_prefix() -> str:
-    # Source of truth: the working file on disk, not any in-memory copy.
-    current = draft_workspace.read_working_draft()
-    if not current:
-        return "[No draft exists in this conversation yet.]\n\n"
-
-    return (
-        "[A draft currently exists — the exact working copy below is what is on "
-        "disk right now.\n"
-        "- If the user requests ANY edit, pass this FULL text back into "
-        "draft_document's user_input with only the requested change applied — "
-        "never call draft_document with just a description of the change.\n"
-        "- If the user explicitly confirms they're satisfied, call "
-        "confirm_draft(confirmed=true) — never pass it any draft content.\n\n"
-        f"{current}\n]\n\n"
     )
 
 
@@ -108,7 +70,6 @@ def main():
     print("=" * 60)
 
     session_id = str(uuid.uuid4())
-    draft_workspace.set_session(session_id)
     active_agent = None
 
     while True:
@@ -135,28 +96,25 @@ def main():
 
         try:
             if active_agent == "/draft":
-                prefix = _build_context_prefix()
-                response = drafting_agent.run(prefix + (message or "continue"), session_id=session_id)
-
-                # confirm_draft is a pure signal. If the agent called it (even
-                # if it malformed the args — small models sometimes do), the
-                # user has approved: finalize deterministically from disk. Its
-                # own return ("confirmed") isn't worth printing.
-                if _was_tool_called(response, "confirm_draft"):
-                    _finalize_from_disk()
+                # Same flow as POST /agents/draft/message — the shared service
+                # runs the agent, rewrites the working file on a draft, and
+                # finalizes deterministically from disk on confirm_draft.
+                turn = run_draft_turn(session_id, message)
+                if turn["finalized"]:
+                    _print_finalize(turn)
                     print("\n(Draft finalized — starting fresh for the next document.)")
                 else:
-                    print(response.content)
+                    print(turn["reply"])
 
             elif active_agent == "/scan":
-                content = message if (matched_cmd == "/scan" and message) else draft_workspace.read_working_draft()
+                content = message if (matched_cmd == "/scan" and message) else draft_workspace.read_working_draft(session_id)
                 if not content:
                     print("No document content available — paste it after /scan, or draft one first with /draft.")
                     continue
 
                 if matched_cmd == "/scan" and message:
                     # Pasted content becomes the working draft so a later /draft can revise it.
-                    draft_workspace.write_working_draft(content)
+                    draft_workspace.write_working_draft(session_id, content)
 
                 response = scanner_agent.run(f"Score this document:\n\n{content}", session_id=session_id)
                 print(response.content)

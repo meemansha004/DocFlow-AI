@@ -13,6 +13,7 @@ writes to it on every result; confirm_draft finalizes whatever that file
 currently holds. The LLM never carries draft content through a tool argument.
 """
 
+from agno.run import RunContext
 from agno.tools import tool
 
 from app.services.draft_generator import draft_document as _draft_document
@@ -20,7 +21,7 @@ from app.services.draft_workspace import write_working_draft
 
 
 @tool
-def draft_document(document_type: str, user_input: str) -> str:
+def draft_document(document_type: str, user_input: str, run_context: RunContext) -> str:
     """
     Drafts a new document from a document type and the user's free-form
     description of what it should contain. Use this when the user wants
@@ -32,9 +33,10 @@ def draft_document(document_type: str, user_input: str) -> str:
         user_input: free-form text describing everything the document
                     should cover — bullets, paragraphs, or a mix
     """
+    # `run_context` is injected by agno (hidden from the model). We use its
+    # session_id so each conversation writes only its own working file.
     result = _draft_document(document_type, user_input)
-    # The working file on disk is the source of truth for "the current draft".
-    write_working_draft(result)
+    write_working_draft(run_context.session_id, result)
     return result
 
 

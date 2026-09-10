@@ -6,10 +6,13 @@ from app.routers import (
     access_requests,
     activity,
     admin,
+    agents,
     auth,
+    document_review,
     documents,
     projects,
     stages,
+    teams,
     workflow,
     workspace,
 )
@@ -33,13 +36,16 @@ app.add_middleware(
 
 app.include_router(auth.router)
 app.include_router(documents.router)
+app.include_router(document_review.router)
 app.include_router(workflow.router)
 app.include_router(workspace.router)
 app.include_router(projects.router)
 app.include_router(stages.router)
+app.include_router(teams.router)
 app.include_router(admin.router)
 app.include_router(access_requests.router)
 app.include_router(activity.router)
+app.include_router(agents.router)
 
 
 @app.get("/health")

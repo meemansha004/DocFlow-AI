@@ -220,12 +220,57 @@ export const stagesApi = {
   },
 };
 
+// ---------- Teams (real backend) ----------
+// Create the teams themselves within a project (NOT user->team assignment —
+// that's adminApi.assignRoles). Creating clears the workspace cache so the
+// "Assign Roles" team dropdown (fed by /workspace) picks up the new team.
+export const teamsApi = {
+  // -> [{ team_id, project_id, name, member_count }]
+  list: (projectId) => request(`/projects/${encodeURIComponent(projectId)}/teams`),
+  create: async (projectId, name) => {
+    const r = await request(`/projects/${encodeURIComponent(projectId)}/teams`, {
+      method: 'POST', body: { name },
+    });
+    clearWorkspaceCache();
+    return r;
+  },
+};
+
 // ---------- Documents ----------
 export const documentsApi = {
   list: (projectId) => projectsApi.documents(projectId),
   listAll: () => notConnected('list all documents'),
   // body: { document_type, stage_id, content, team_id, sensitivity_level }
   upload: (data) => request('/documents/upload', { method: 'POST', body: data }),
+  // Real file upload (PDF/DOCX/TXT/MD) -> auto-scan -> seeds a review chat
+  // session. multipart/form-data, so it bypasses request()'s JSON body.
+  // -> { document_id, version_id, stage_id, stage_name, sensitivity_level,
+  //      uploaded_as_team_id, status, session_id, scan, scan_error,
+  //      scan_skipped, reformed_content, injection_flagged,
+  //      injection_findings, reply }
+  uploadFile: async ({ file, stageId, teamId, sensitivityLevel = 'internal' }) => {
+    const form = new FormData();
+    form.append('file', file);
+    form.append('stage_id', stageId);
+    form.append('team_id', teamId);
+    form.append('sensitivity_level', sensitivityLevel);
+
+    const token = getToken();
+    const res = await fetch(`${API_BASE}/documents/upload-file`, {
+      method: 'POST',
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+      body: form,
+    });
+    const text = await res.text();
+    let payload = null;
+    if (text) { try { payload = JSON.parse(text); } catch { payload = text; } }
+    if (!res.ok) {
+      let detail = res.statusText || 'Upload failed';
+      if (payload && typeof payload.detail === 'string') detail = payload.detail;
+      throw new ApiError(detail, res.status, payload);
+    }
+    return payload;
+  },
   uploadBatch: () => notConnected('batch upload'),
   versions: () => notConnected('document versions'),
   uploadVersion: () => notConnected('upload new version'),
@@ -241,6 +286,18 @@ export const documentsApi = {
       method: 'POST', body: { reason },
     }),
   status: (documentId) => request(`/documents/${encodeURIComponent(documentId)}/status`),
+};
+
+// ---------- Document review chat (upload + scan + revise + index) ----------
+// One turn of the post-upload review conversation — reuses the SAME
+// drafting_agent as chat-drafting, but finalize writes a new DocumentVersion
+// on the uploaded document instead of a downloadable file.
+export const documentReviewApi = {
+  message: (documentId, sessionId, message) =>
+    request('/documents/review/message', {
+      method: 'POST',
+      body: { document_id: documentId, session_id: sessionId, message: message || '' },
+    }),
 };
 
 // ---------- Not connected yet ----------
@@ -314,7 +371,32 @@ export const accessRequestsApi = {
 
 export const ragApi = stub('RAG / retrieval');
 export const chatApi = stub('chat');
-export const agentsApi = stub('AI agents');
+
+// ---------- Agents: Drafting flow is REAL (decoupled from persistence) ----------
+// POST /agents/draft/message runs one drafting turn; the finalized draft is a
+// standalone local file fetched via GET /agents/draft/download/{filename}.
+export const agentsApi = {
+  // -> { reply, drafted, finalized, scan, scan_error, final_content,
+  //      download_url, filename }
+  draftMessage: (sessionId, message) =>
+    request('/agents/draft/message', {
+      method: 'POST',
+      body: { session_id: sessionId, message: message || '' },
+    }),
+  // Auth'd blob fetch — a plain <a href download> can't send the Bearer token.
+  draftDownload: async (downloadUrl) => {
+    const token = getToken();
+    const res = await fetch(`${API_BASE}${downloadUrl}`, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    });
+    if (!res.ok) throw new ApiError('Could not download the draft', res.status);
+    return res.blob();
+  },
+  // still no backend:
+  analyzeGaps: () => notConnected('gap analysis'),
+  followups: () => notConnected('follow-up questions'),
+};
+
 export const studioApi = stub('Studio');
 export const notesApi = stub('Notes');
 export const notificationsApi = stub('Notifications');

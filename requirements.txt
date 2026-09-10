@@ -9,3 +9,4 @@ pydantic-settings==2.5.2
 python-multipart==0.0.9
 qdrant-client==1.19.0
 fastembed==0.8.0
+reportlab==5.0.1  # test-only: generates a real PDF for scripts/verify_document_upload_review.py

@@ -1,70 +1,84 @@
-import React from 'react';
-import { Bot, ScanSearch, SearchCheck, Database, MessageSquare } from 'lucide-react';
-import { Link } from 'react-router-dom';
+import React, { useRef } from 'react';
+import { X, Upload, FileText } from 'lucide-react';
 import TemplateCard from './TemplateCard';
-import UploadDocumentCard from './UploadDocumentCard';
+import DocFileCard from '../ui/DocFileCard';
 
-const StudioPanel = ({ projectId, onAnalyzeGaps }) => {
+// The Studio panel (Part 2): a toggleable side panel — NOT a permanent column.
+// Contains ONLY the document-template list plus a scratch/working template
+// upload (client-side only — no persistence, no ABAC). Finalized drafts do NOT
+// appear here; they live in the Chat Interface as a file card.
+const StudioPanel = ({
+  onClose,
+  scratchTemplate,
+  onScratchUpload,
+  onScratchClear,
+  onScratchView,
+}) => {
+  const fileRef = useRef(null);
+
+  const handleFile = (e) => {
+    const file = e.target.files?.[0];
+    e.target.value = ''; // allow re-selecting the same file
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => onScratchUpload?.({ name: file.name, content: String(reader.result || '') });
+    reader.readAsText(file);
+  };
+
   return (
-    <div className="flex flex-col bg-surface lg:border-l border-border">
-      <div className="p-4 border-b border-border/50">
-        <div className="flex items-center justify-between"><h2 className="text-lg font-semibold text-gray-100">Studio</h2><span className="text-[10px] uppercase tracking-widest text-accent-light font-bold">Create</span></div>
-        <p className="text-sm text-gray-400 mt-1">Create project documents using AI-powered templates.</p>
+    <div className="flex h-full flex-col bg-surface">
+      <div className="flex items-center justify-between p-4 border-b border-border/50 shrink-0">
+        <div>
+          <h2 className="text-lg font-semibold text-gray-100">Studio</h2>
+          <p className="text-sm text-gray-400 mt-0.5">Document templates &amp; a working reference file.</p>
+        </div>
+        <button
+          type="button"
+          onClick={onClose}
+          aria-label="Close Studio"
+          className="rounded-md p-1.5 text-gray-400 hover:text-gray-100 hover:bg-surface-hover transition-colors"
+        >
+          <X size={18} />
+        </button>
       </div>
-      <div className="p-4">
-        <div className="mb-6">
-          <div className="flex items-center justify-between mb-3">
-            <h3 className="text-xs font-bold text-gray-500 uppercase tracking-wider">AI agents</h3>
-            <span className="text-[10px] uppercase tracking-widest text-primary font-bold">Ready</span>
-          </div>
-          <div className="space-y-2">
-            <Link to={`/projects/${projectId}/studio/prd`} className="flex items-center gap-3 rounded-lg border border-border bg-background p-3 hover:border-primary/50 hover:bg-surface-hover transition-colors">
-              <span className="w-8 h-8 rounded-lg bg-primary/10 text-primary flex items-center justify-center"><Bot size={16} /></span>
-              <span className="min-w-0"><span className="block text-sm font-medium text-gray-200">Drafting Agent</span><span className="block text-xs text-gray-500 truncate">Turn instructions into structured documents</span></span>
-            </Link>
-            <Link to={`/projects/${projectId}/studio/scan`} className="flex items-center gap-3 rounded-lg border border-border bg-background p-3 hover:border-primary/50 hover:bg-surface-hover transition-colors">
-              <span className="w-8 h-8 rounded-lg bg-accent/10 text-accent-light flex items-center justify-center"><ScanSearch size={16} /></span>
-              <span className="min-w-0"><span className="block text-sm font-medium text-gray-200">Scanner Agent</span><span className="block text-xs text-gray-500 truncate">Score, revise, and improve a generated draft</span></span>
-            </Link>
-            <button type="button" onClick={onAnalyzeGaps} className="w-full flex items-center gap-3 rounded-lg border border-border bg-background p-3 text-left hover:border-primary/50 hover:bg-surface-hover transition-colors">
-              <span className="w-8 h-8 rounded-lg bg-amber-500/10 text-amber-400 flex items-center justify-center"><SearchCheck size={16} /></span>
-              <span className="min-w-0"><span className="block text-sm font-medium text-gray-200">Gap Detection Agent</span><span className="block text-xs text-gray-500 truncate">Find missing coverage across SDLC stages</span></span>
-            </button>
-            <Link to={`/studio/query?agent=rag&project_id=${encodeURIComponent(projectId)}`} className="flex items-center gap-3 rounded-lg border border-border bg-background p-3 hover:border-primary/50 hover:bg-surface-hover transition-colors">
-              <span className="w-8 h-8 rounded-lg bg-cyan-500/10 text-cyan-300 flex items-center justify-center"><Database size={16} /></span>
-              <span className="min-w-0"><span className="block text-sm font-medium text-gray-200">RAG Retrieval Agent</span><span className="block text-xs text-gray-500 truncate">Search authorized source chunks</span></span>
-            </Link>
-            <Link to={`/studio/query?project_id=${encodeURIComponent(projectId)}`} className="flex items-center gap-3 rounded-lg border border-border bg-background p-3 hover:border-primary/50 hover:bg-surface-hover transition-colors">
-              <span className="w-8 h-8 rounded-lg bg-indigo-500/10 text-indigo-300 flex items-center justify-center"><MessageSquare size={16} /></span>
-              <span className="min-w-0"><span className="block text-sm font-medium text-gray-200">General Query Agent</span><span className="block text-xs text-gray-500 truncate">Ask grounded questions about this project</span></span>
-            </Link>
-          </div>
-        </div>
-        <div className="mb-6">
-          <h3 className="text-xs font-bold text-gray-500 uppercase tracking-wider mb-3">Document templates</h3>
-          <TemplateCard 
-            templateId="prd" 
-            title="PRD" 
-            description="Product Requirements Document" 
+
+      <div className="flex-1 min-h-0 overflow-y-auto p-4">
+        <h3 className="text-xs font-bold text-gray-500 uppercase tracking-wider mb-3">Document templates</h3>
+        <TemplateCard templateId="prd" title="PRD" description="Product Requirements Document" />
+        <TemplateCard templateId="ard" title="ARD" description="Architecture Requirements Document" />
+        <TemplateCard templateId="test-plan" title="Test Plan" description="Quality Assurance Test Plan" />
+        <TemplateCard templateId="brd" title="Business Requirements" description="Business Requirements Document" />
+
+        <h3 className="text-xs font-bold text-gray-500 uppercase tracking-wider mt-6 mb-3">Working template</h3>
+        <input
+          ref={fileRef}
+          type="file"
+          accept=".md,.markdown,.txt,text/markdown,text/plain"
+          onChange={handleFile}
+          className="hidden"
+        />
+        {scratchTemplate ? (
+          <DocFileCard
+            title={scratchTemplate.name}
+            meta="Working template · not saved"
+            onOpen={() => onScratchView?.(scratchTemplate)}
+            onRemove={() => onScratchClear?.()}
           />
-          <TemplateCard 
-            templateId="ard" 
-            title="ARD" 
-            description="Architecture Requirements Document" 
-          />
-          <TemplateCard 
-            templateId="test-plan" 
-            title="Test Plan" 
-            description="Quality Assurance Test Plan" 
-          />
-          <TemplateCard 
-            templateId="brd" 
-            title="Business Requirements" 
-            description="Business Requirements Document" 
-          />
-        </div>
-        
-        <UploadDocumentCard />
+        ) : (
+          <button
+            type="button"
+            onClick={() => fileRef.current?.click()}
+            className="w-full flex flex-col items-center justify-center gap-1.5 rounded-lg border-2 border-dashed border-border bg-background/50 p-5 text-center hover:border-primary/50 transition-colors"
+          >
+            <Upload size={20} className="text-primary" />
+            <span className="text-sm font-medium text-gray-200">Upload a template</span>
+            <span className="text-xs text-gray-500">A working reference file (.md / .txt) — kept only for this session.</span>
+          </button>
+        )}
+        <p className="mt-2 text-[11px] text-gray-600 flex items-start gap-1">
+          <FileText size={12} className="mt-0.5 shrink-0" />
+          Not persisted and not added to Sources — just a reference while you work.
+        </p>
       </div>
     </div>
   );

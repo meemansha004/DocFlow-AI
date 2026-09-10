@@ -39,5 +39,8 @@ def save_draft(content: str, *, name_hint: str | None = None) -> str:
     hint = name_hint or _first_heading(content) or "draft"
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     path = DRAFTS_DIR / f"{_slug(hint)}-{timestamp}.md"
-    path.write_text(content, encoding="utf-8")
+    # write_bytes, not write_text: on Windows write_text rewrites "\n" as
+    # "\r\n", which would make the saved file's bytes differ from the exact
+    # content that was scanned and shown to the user.
+    path.write_bytes(content.encode("utf-8"))
     return str(path)

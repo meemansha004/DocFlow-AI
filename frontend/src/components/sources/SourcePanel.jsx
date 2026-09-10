@@ -1,5 +1,5 @@
-import React, { useMemo, useState } from 'react';
-import { Plus, Pencil, ArrowUp, ArrowDown, ShieldCheck, Trash2, Settings2, Link2, Users } from 'lucide-react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { Plus, Pencil, ArrowUp, ArrowDown, ShieldCheck, Trash2, Settings2, Link2, Users, UploadCloud } from 'lucide-react';
 import { STAGES } from '../../constants/stages';
 import StageSection from './StageSection';
 import KebabMenu from '../ui/KebabMenu';
@@ -7,7 +7,9 @@ import Modal from '../ui/Modal';
 import Button from '../ui/Button';
 import Input from '../ui/Input';
 import Dropdown from '../ui/Dropdown';
-import { stagesApi } from '../../lib/api';
+import { stagesApi, documentsApi } from '../../lib/api';
+
+const UPLOAD_ACCEPT = '.pdf,.docx,.txt,.md,.markdown,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,text/plain,text/markdown';
 
 const SourcePanel = ({
   documents = [],
@@ -19,6 +21,7 @@ const SourcePanel = ({
   teams = [],
   canManageStages = false,
   onStagesChanged,
+  onDocumentUploaded,
 }) => {
   const groupedDocs = useMemo(() => documents.reduce((acc, doc) => {
     const stage = doc.stage || 'Unspecified';
@@ -59,6 +62,16 @@ const SourcePanel = ({
   const [stageErr, setStageErr] = useState('');
   const [stageNotice, setStageNotice] = useState('');
 
+  // --- upload-doc modal ---
+  const [uploadOpen, setUploadOpen] = useState(false);
+  const [uploadFile, setUploadFile] = useState(null);
+  const [uploadStageId, setUploadStageId] = useState('');
+  const [uploadTeamId, setUploadTeamId] = useState('');
+  const [uploadSensitivity, setUploadSensitivity] = useState('internal');
+  const [uploadBusy, setUploadBusy] = useState(false);
+  const [uploadErr, setUploadErr] = useState('');
+  const uploadFileRef = useRef(null);
+
   const countFor = (name) => (groupedDocs[name] || []).length;
   // A single silent reload (docs + stages) — keeps the settings modal open.
   const refresh = async () => { await onStagesChanged?.(); };
@@ -87,6 +100,59 @@ const SourcePanel = ({
       setCreateErr(err.message || 'Could not create the stage.');
     } finally {
       setCreateBusy(false);
+    }
+  };
+
+  // --- upload-doc modal -----------------------------------------------
+
+  const openUpload = () => {
+    setUploadOpen(true);
+    setUploadFile(null);
+    setUploadStageId('');
+    setUploadTeamId('');
+    setUploadSensitivity('internal');
+    setUploadErr('');
+    if (uploadFileRef.current) uploadFileRef.current.value = '';
+  };
+
+  // Which of the caller's teams can actually upload to the selected stage.
+  // Admins (canManageStages) bypass team_stage_access entirely, same as the
+  // backend — any team in the project is a valid choice for them.
+  const eligibleUploadTeams = useMemo(() => {
+    const stage = orderedStages.find((s) => s.stage_id === uploadStageId);
+    if (!stage) return [];
+    if (canManageStages) return teams;
+    const granted = new Set(stage.team_access || []);
+    return teams.filter((t) => granted.has(t.team_id));
+  }, [uploadStageId, orderedStages, teams, canManageStages]);
+
+  // Auto-infer the team when there's exactly one eligible choice; otherwise
+  // clear it so the dropdown forces an explicit pick.
+  useEffect(() => {
+    if (eligibleUploadTeams.length === 1) {
+      setUploadTeamId(eligibleUploadTeams[0].team_id);
+    } else if (!eligibleUploadTeams.some((t) => t.team_id === uploadTeamId)) {
+      setUploadTeamId('');
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [eligibleUploadTeams]);
+
+  const handleUpload = async () => {
+    if (!uploadFile || !uploadStageId || !uploadTeamId) return;
+    setUploadBusy(true); setUploadErr('');
+    try {
+      const result = await documentsApi.uploadFile({
+        file: uploadFile, stageId: uploadStageId, teamId: uploadTeamId,
+        sensitivityLevel: uploadSensitivity,
+      });
+      setUploadOpen(false);
+      await refresh();
+      onChanged?.();
+      onDocumentUploaded?.({ ...result, originalFilename: uploadFile.name });
+    } catch (err) {
+      setUploadErr(err.message || 'Could not upload the document.');
+    } finally {
+      setUploadBusy(false);
     }
   };
 
@@ -191,7 +257,14 @@ const SourcePanel = ({
     <div className="flex flex-col bg-surface border-r border-border lg:min-h-full">
       <div className="p-4 border-b border-border/50">
         <div className="flex items-center justify-between">
-          <h2 className="text-lg font-semibold text-gray-100">Sources</h2>
+          <div className="flex items-center gap-2 min-w-0">
+            <h2 className="text-lg font-semibold text-gray-100">Sources</h2>
+            {orderedStages.length > 0 && (
+              <Button size="sm" variant="secondary" icon={UploadCloud} onClick={openUpload}>
+                Upload Doc
+              </Button>
+            )}
+          </div>
           <div className="flex items-center gap-2">
             <span className="text-[10px] uppercase tracking-widest text-primary font-bold">Library</span>
             {canManageStages && (
@@ -440,6 +513,86 @@ const SourcePanel = ({
             </div>
           </div>
         )}
+      </Modal>
+
+      {/* Upload a real document */}
+      <Modal
+        open={uploadOpen}
+        onClose={() => setUploadOpen(false)}
+        title="Upload document"
+        description="A real file (PDF, DOCX, TXT, or MD). It's scanned automatically and opens in the Chat Interface for review — nothing is indexed until you finalize there."
+        footer={(
+          <>
+            <Button variant="ghost" onClick={() => setUploadOpen(false)}>Cancel</Button>
+            <Button
+              icon={UploadCloud}
+              loading={uploadBusy}
+              disabled={!uploadFile || !uploadStageId || !uploadTeamId}
+              onClick={handleUpload}
+            >
+              Upload
+            </Button>
+          </>
+        )}
+      >
+        <div className="space-y-4">
+          {uploadErr && <p className="text-sm text-red-400">{uploadErr}</p>}
+
+          <div>
+            <p className="text-sm font-medium text-gray-300 mb-1.5">File</p>
+            <input
+              ref={uploadFileRef}
+              type="file"
+              accept={UPLOAD_ACCEPT}
+              onChange={(e) => setUploadFile(e.target.files?.[0] || null)}
+              className="block w-full text-sm text-gray-300 file:mr-3 file:rounded-md file:border-0 file:bg-primary/10 file:px-3 file:py-1.5 file:text-primary file:text-sm file:cursor-pointer hover:file:bg-primary/20"
+            />
+            {uploadFile && (
+              <p className="mt-1 text-xs text-gray-500">
+                {uploadFile.name} · {(uploadFile.size / 1024).toFixed(1)} KB
+              </p>
+            )}
+          </div>
+
+          <Dropdown
+            label="Stage"
+            value={uploadStageId}
+            onChange={setUploadStageId}
+            options={orderedStages.map((s) => ({ label: s.name, value: s.stage_id }))}
+            placeholder={orderedStages.length ? 'Select a stage…' : 'No accessible stages'}
+          />
+
+          {uploadStageId && (
+            eligibleUploadTeams.length === 0 ? (
+              <p className="text-xs text-amber-400">
+                None of your teams have access to this stage.
+              </p>
+            ) : eligibleUploadTeams.length === 1 ? (
+              <p className="text-xs text-gray-500">
+                Uploading as <span className="text-gray-300">{eligibleUploadTeams[0].name}</span>.
+              </p>
+            ) : (
+              <Dropdown
+                label="Upload as team"
+                value={uploadTeamId}
+                onChange={setUploadTeamId}
+                options={eligibleUploadTeams.map((t) => ({ label: t.name, value: t.team_id }))}
+                placeholder="Select a team…"
+              />
+            )
+          )}
+
+          <Dropdown
+            label="Sensitivity"
+            value={uploadSensitivity}
+            onChange={setUploadSensitivity}
+            options={[
+              { label: 'Public', value: 'public' },
+              { label: 'Internal', value: 'internal' },
+              { label: 'Confidential', value: 'confidential' },
+            ]}
+          />
+        </div>
       </Modal>
     </div>
   );

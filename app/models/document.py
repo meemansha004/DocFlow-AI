@@ -154,6 +154,13 @@ class DocumentScan(Base):
     reform_triggered: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     reformed_content: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    # Injection Scanner (Phase B gap-closer's third check, alongside
+    # score/reform) — separate axis from structural quality. A flagged scan
+    # blocks `indexed` status regardless of overall_score; see
+    # app.services.injection_scan.
+    injection_flagged: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    injection_findings: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+
     review_status: Mapped[ScanReviewStatus] = mapped_column(
         Enum(ScanReviewStatus, name="scan_review_status"),
         default=ScanReviewStatus.not_required,

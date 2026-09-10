@@ -1,6 +1,7 @@
 from agno.tools import tool
 from app.services.scan_score import score_document as _score_document
 from app.services.scan_reformer import reform_document as _reform_document
+from app.services.injection_scan import scan_for_injection as _scan_for_injection
 
 @tool
 def score_document(document_markdown: str) -> dict:
@@ -28,3 +29,19 @@ def reform_document(document_markdown: str, scan_result: dict) -> str:
         scan_result: the dict previously returned by score_document
     """
     return _reform_document(document_markdown, scan_result)
+
+@tool
+def check_injection(document_markdown: str) -> dict:
+    """
+    Checks a document's Markdown content for prompt-injection-style patterns
+    (instruction-override phrasing, jailbreak/role-override attempts, fake
+    system-prompt markers, prompt-extraction attempts) — a SAFETY check,
+    separate from structural quality. Use this whenever asked to check a
+    document for injected/malicious instructions, or before a document is
+    approved to be indexed. Never judge this yourself from reading the text —
+    always call this tool.
+
+    Args:
+        document_markdown: the document's content in Markdown format
+    """
+    return _scan_for_injection(document_markdown)
