@@ -22,6 +22,7 @@ search on top of it. Built and tested now.
 """
 
 import uuid
+from functools import lru_cache
 
 from qdrant_client import QdrantClient, models
 
@@ -36,10 +37,22 @@ SPARSE_VECTOR_NAME = "sparse"
 INDEXED_PAYLOAD_FIELDS = ("tenant_id", "project_id", "stage_id")
 
 
+@lru_cache(maxsize=1)
 def get_qdrant_client() -> QdrantClient:
     """
     QDRANT_URL blank -> embedded local mode: on-disk at QDRANT_LOCAL_PATH,
     no server, no key. QDRANT_URL set -> connect to that Qdrant instance.
+
+    Cached as a process-wide singleton — this is not just an optimization.
+    Embedded/local-mode Qdrant file-locks its storage directory and refuses
+    a second concurrent open, even from the SAME process ("Storage folder
+    ... is already accessed by another instance of Qdrant client"). A fresh
+    QdrantClient(path=...) on every call would work in isolation but break
+    the moment anything else in the process (a script, a later request)
+    still holds an earlier one open. One shared client avoids that entirely
+    and is the documented pattern for embedded mode. Server mode (QDRANT_URL
+    set) has no such constraint, but sharing one client there is still
+    correct and cheaper than reconnecting per call.
     """
     if QDRANT_URL:
         return QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY or None)

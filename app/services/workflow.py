@@ -135,7 +135,7 @@ def approve_document(
     # half of should_index() for a requires_approval stage — the version may
     # already be Scanner-`indexed` and was only waiting on this.
     if should_index(db, document_id):
-        index_document(document_id)  # stub — chunking/embedding not yet built
+        index_document(db, document_id)
 
     return state
 

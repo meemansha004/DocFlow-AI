@@ -16,21 +16,37 @@ actual "ready to index" verdict. Call it after any event that could flip
 either axis: document_finalize.py's finalize step, and the end of
 approve_document() in app/services/workflow.py.
 
-index_document() is a STUB — chunking/embedding into the Qdrant collection
-(app/services/rag/collection_setup.py) is Phase B's next piece and is NOT
-implemented here. This module only decides WHEN that call should happen.
+index_document() chunks the document's current version, embeds each chunk
+(dense + sparse), and upserts into its tenant's Qdrant collection
+(app/services/rag/collection_setup.py) — replacing older points for the
+same document_id first, so a re-indexed document is never simultaneously
+searchable under two versions.
 """
 
 import logging
 import uuid
 
+from qdrant_client import models as qm
 from sqlalchemy.orm import Session
 
 from app.models.document import Document, DocumentStatus, DocumentVersion
+from app.models.project import Project
 from app.models.stage import Stage
 from app.models.workflow import WorkflowState, WorkflowStatus
+from app.services.rag.chunking import chunk_document
+from app.services.rag.collection_setup import (
+    DENSE_VECTOR_NAME,
+    SPARSE_VECTOR_NAME,
+    ensure_tenant_collection,
+    get_qdrant_client,
+)
+from app.services.rag.embedding import embed_dense, embed_sparse
 
 logger = logging.getLogger(__name__)
+
+
+class DocumentNotIndexableError(Exception):
+    pass
 
 
 def should_index(db: Session, document_id: uuid.UUID) -> bool:
@@ -65,17 +81,107 @@ def should_index(db: Session, document_id: uuid.UUID) -> bool:
     return True
 
 
-def index_document(document_id: uuid.UUID) -> None:
+def _delete_existing_points(client, collection: str, document_id: uuid.UUID) -> None:
     """
-    TODO(Phase B — RAG indexing, not yet built): chunk this document's
-    current version content and upsert dense+sparse embeddings into its
-    tenant's Qdrant collection (app/services/rag/collection_setup.py).
-
-    Stub only — logs so call sites (finalize, approve_document) can be
-    wired and tested against should_index() independently of the actual
-    chunking/embedding pipeline.
+    Remove every existing point for this document_id, unconditionally — runs
+    even on first index (a harmless no-op then), so a re-indexed document is
+    never simultaneously searchable under two versions. document_id isn't a
+    payload-indexed field (see collection_setup.py — only tenant_id/
+    project_id/stage_id are), so this is a filtered scan, not an indexed
+    lookup; fine at our data volumes.
     """
-    logger.info(
-        "index_document() stub called for document_id=%s — RAG indexing not yet implemented",
-        document_id,
+    client.delete(
+        collection_name=collection,
+        points_selector=qm.FilterSelector(
+            filter=qm.Filter(
+                must=[qm.FieldCondition(key="document_id", match=qm.MatchValue(value=str(document_id)))]
+            )
+        ),
     )
+
+
+def index_document(db: Session, document_id: uuid.UUID) -> dict:
+    """
+    Chunks the document's CURRENT version content (already-parsed Markdown —
+    no re-parsing; see finalize_document_revision/create_document_from_file,
+    the only two places DocumentVersion.file_data is ever written), embeds
+    each chunk (dense + sparse), and upserts into the tenant's Qdrant
+    collection. Deletes any of this document's existing points first.
+
+    Only ever called after should_index() has confirmed the version is
+    ready (DocumentVersion.status == indexed, and approved if the stage
+    requires it) — this function does not re-check that itself.
+
+    Returns:
+        {"collection": str, "chunks_indexed": int, "chunks": [chunk dicts]}
+
+    Raises:
+        DocumentNotIndexableError: no current version, or its content isn't
+            valid UTF-8 text (shouldn't happen for an `indexed` version).
+    """
+    document = db.get(Document, document_id)
+    if document is None or document.current_version_id is None:
+        raise DocumentNotIndexableError(f"Document {document_id} has no current version")
+
+    version = db.get(DocumentVersion, document.current_version_id)
+    if version is None:
+        raise DocumentNotIndexableError(f"Document {document_id}'s current version is missing")
+    try:
+        content = version.file_data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise DocumentNotIndexableError(
+            f"Document {document_id}'s current version is not valid UTF-8 text"
+        ) from exc
+
+    project = db.get(Project, document.project_id)
+    stage = db.get(Stage, document.stage_id)
+
+    chunks = chunk_document(content)
+    if not chunks:
+        logger.info("index_document(%s): nothing to index (empty content)", document_id)
+        chunks = []
+
+    # Contextual header — baked into the EMBEDDED text only. The stored
+    # chunk_text payload field stays the clean original (see chunk_document's
+    # own docstring) so it displays cleanly wherever it's read back later.
+    embed_texts = [
+        f"Project: {project.name if project else ''} | "
+        f"Stage: {stage.name if stage else ''} | "
+        f"Section: {chunk['section_title']}\n\n{chunk['chunk_text']}"
+        for chunk in chunks
+    ]
+
+    dense_vectors = embed_dense(embed_texts)
+    sparse_vectors = embed_sparse(embed_texts)
+
+    client = get_qdrant_client()
+    collection = ensure_tenant_collection(client, document.tenant_id)
+
+    _delete_existing_points(client, collection, document_id)
+
+    if chunks:
+        points = [
+            qm.PointStruct(
+                id=str(uuid.uuid4()),
+                vector={
+                    DENSE_VECTOR_NAME: dense_vectors[i],
+                    SPARSE_VECTOR_NAME: sparse_vectors[i],
+                },
+                payload={
+                    "document_id": str(document_id),
+                    "project_id": str(document.project_id),
+                    "tenant_id": str(document.tenant_id),
+                    "stage_id": str(document.stage_id),
+                    "section_title": chunk["section_title"],
+                    "chunk_text": chunk["chunk_text"],
+                },
+            )
+            for i, chunk in enumerate(chunks)
+        ]
+        client.upsert(collection_name=collection, points=points)
+
+    logger.info(
+        "index_document(%s): indexed %d chunk(s) into %s", document_id, len(chunks), collection
+    )
+
+    return {"collection": collection, "chunks_indexed": len(chunks), "chunks": chunks}

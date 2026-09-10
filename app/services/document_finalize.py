@@ -189,7 +189,7 @@ def finalize_document_revision(db: Session, *, document_id: uuid.UUID, user_id: 
     # own should_index() call for the other half of this trigger.
     ready_to_index = should_index(db, document_id)
     if ready_to_index:
-        index_document(document_id)  # stub — chunking/embedding not yet built
+        index_document(db, document_id)
 
     return {
         "version_id": str(version_id),
