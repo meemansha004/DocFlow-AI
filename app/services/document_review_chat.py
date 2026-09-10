@@ -42,6 +42,7 @@ def run_review_turn(db: Session, *, session_id: str, document_id: uuid.UUID, use
           "scan": dict | None, "scan_error": str | None,
           "reformed_content": str | None,
           "injection_flagged": bool | None, "injection_findings": list | None,
+          "should_index": bool | None,   # the indexing trigger's verdict, finalize only
         }
     """
     prefix = build_context_prefix(session_id)
@@ -58,7 +59,7 @@ def run_review_turn(db: Session, *, session_id: str, document_id: uuid.UUID, use
         "reply": reply, "drafted": False, "finalized": False,
         "version_id": None, "version_number": None, "status": None,
         "scan": None, "scan_error": None, "reformed_content": None,
-        "injection_flagged": None, "injection_findings": None,
+        "injection_flagged": None, "injection_findings": None, "should_index": None,
     }
 
     if _tool_called(response, "confirm_draft"):
@@ -78,6 +79,7 @@ def run_review_turn(db: Session, *, session_id: str, document_id: uuid.UUID, use
             reformed_content=outcome["reformed_content"],
             injection_flagged=outcome["injection_flagged"],
             injection_findings=outcome["injection_findings"],
+            should_index=outcome["should_index"],
         )
         return base
 

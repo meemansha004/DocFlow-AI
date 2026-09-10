@@ -3,16 +3,22 @@ Finalizing a document-review chat session (upload -> auto-scan -> revise in
 chat -> finalize), distinct in meaning from Phase 4's chat-drafting finalize:
 this writes a NEW DocumentVersion on the SAME Document row (never a new
 Document — single-stage-per-upload; cross-stage relevance is handled by
-stage_references, not multi-stage uploads) and, only on a passing/unflagged
-scan, flips status from pending_review to indexed. That indexed transition
-is what Phase B's RAG-indexing trigger fires on.
+stage_references, not multi-stage uploads).
+
+Status on the new version is Scanner-driven ONLY, independent of any
+approval policy: `indexed` if the scan passed AND nothing was flagged,
+`needs_attention` otherwise (a failed structural score and a flagged
+injection scan both route here — same human-review surface). Whether an
+`indexed` version is actually ready to be indexed (which may ALSO require
+human approval, on a requires_approval stage) is should_index()'s job —
+see app/services/indexing.py — called at the end of this function.
 
 run_full_scan() is shared by the upload-time auto-scan
 (document_upload_review.py) and this finalize step: score_document, then
 (mirroring the Scanner Agent's own documented sequence) reform_document if
-the score is below threshold, then check_injection — always, regardless of
-score, since it's a cheap deterministic gate, not an expensive rescan being
-guarded against.
+the score is below threshold, then scan_for_injection — always, regardless
+of score, since it's a cheap deterministic gate, not an expensive rescan
+being guarded against.
 """
 
 import uuid
@@ -29,6 +35,7 @@ from app.models.document import (
 )
 from app.services import draft_workspace
 from app.services.audit import record_audit
+from app.services.indexing import index_document, should_index
 from app.services.injection_scan import scan_for_injection
 from app.services.scan_prompts import REFORMATION_THRESHOLD
 from app.services.scan_reformer import ReformationError, reform_document
@@ -149,7 +156,11 @@ def finalize_document_revision(db: Session, *, document_id: uuid.UUID, user_id: 
         file_data=content_bytes,
         file_size_bytes=len(content_bytes),
         uploaded_by=user_id,
-        status=DocumentStatus.indexed if passed else DocumentStatus.pending_review,
+        # Scanner-driven only — independent of any approval policy. A failed
+        # structural score and a flagged injection scan both land here
+        # (needs_attention), never pending_review: finalize is a definitive
+        # decision point, not an "awaiting first look" state like upload is.
+        status=DocumentStatus.indexed if passed else DocumentStatus.needs_attention,
     )
     db.add(version)
     db.flush()
@@ -171,6 +182,15 @@ def finalize_document_revision(db: Session, *, document_id: uuid.UUID, user_id: 
 
     draft_workspace.delete_working_draft(session_id)
 
+    # Indexing trigger (app/services/indexing.py): combines this version's
+    # just-set Scanner status with the stage's approval policy (if any). On
+    # a requires_approval stage, an `indexed` version still needs a human
+    # approve_document() call before this returns True — see that function's
+    # own should_index() call for the other half of this trigger.
+    ready_to_index = should_index(db, document_id)
+    if ready_to_index:
+        index_document(document_id)  # stub — chunking/embedding not yet built
+
     return {
         "version_id": str(version_id),
         "version_number": new_version_number,
@@ -180,4 +200,5 @@ def finalize_document_revision(db: Session, *, document_id: uuid.UUID, user_id: 
         "reformed_content": scan_outcome["reformed_content"],
         "injection_flagged": scan_outcome["injection"]["flagged"],
         "injection_findings": scan_outcome["injection"]["findings"],
+        "should_index": ready_to_index,
     }

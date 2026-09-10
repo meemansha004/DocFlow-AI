@@ -13,9 +13,13 @@ Lifecycle:
 A rejected document can be resubmitted (its stale rejection_reason is cleared);
 an approved document is terminal.
 
-This is purely human sign-off and has nothing to do with the Structure
-Scanner (which only runs in the decoupled chat-drafting flow, not on real
-document persistence).
+This is purely human sign-off — an independent axis from the Structure/
+Injection Scanner (app/services/document_finalize.py), which sets
+DocumentVersion.status on every real upload/finalize regardless of whether
+the stage requires approval. approve_document() calls should_index()
+(app/services/indexing.py) at the end: on a requires_approval stage, a
+version can already be Scanner-`indexed` and still be waiting on exactly
+this approval before it's actually ready to index.
 
 Gating: has_permission(db, user_id, <action>, team_id, project_id), where
 team_id / project_id are the DOCUMENT's team and project. Per §3/4:
@@ -37,6 +41,7 @@ from sqlalchemy.orm import Session
 from app.models.workflow import WorkflowState, WorkflowStatus
 from app.services.access_control import has_permission
 from app.services.audit import record_audit
+from app.services.indexing import index_document, should_index
 
 
 class WorkflowError(Exception):
@@ -125,6 +130,13 @@ def approve_document(
         resource_id=document_id, details={"state": "approved"},
     )
     db.commit()
+
+    # Indexing trigger (app/services/indexing.py): approval is the OTHER
+    # half of should_index() for a requires_approval stage — the version may
+    # already be Scanner-`indexed` and was only waiting on this.
+    if should_index(db, document_id):
+        index_document(document_id)  # stub — chunking/embedding not yet built
+
     return state
 
 

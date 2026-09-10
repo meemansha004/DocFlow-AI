@@ -3,7 +3,9 @@ Upload entry point for the "upload + scan + revise-in-chat + index" flow.
 
 upload_and_scan() ties together:
   - document_persistence.create_document_from_file() — real file bytes ->
-    Document + DocumentVersion (v1, pending_review), parsed to Markdown
+    Document + DocumentVersion (v1, pending_review by default), parsed to
+    Markdown (Docling, called exactly once — every downstream step below
+    reuses this same parsed_content, never re-parses)
   - a content-hash marker check (draft_workspace.check_scan_marker) — if this
     exact file was previously finalized by chat-drafting (Phase 4) and is
     unchanged, SKIP the paid structural rescan and reuse its embedded score
@@ -11,7 +13,8 @@ upload_and_scan() ties together:
     shared run_full_scan) otherwise
   - the Injection Scanner — ALWAYS runs regardless of the marker, since it's
     a cheap deterministic security gate, not the expensive check being
-    skipped
+    skipped. A flagged upload gets its v1 status corrected from the default
+    pending_review to needs_attention (the row is still created either way)
   - persisting a DocumentScan row for v1
   - seeding the review chat session's on-disk working file (same
     draft_workspace machinery as Phase 4) with the parsed content, so the
@@ -22,7 +25,7 @@ import uuid
 
 from sqlalchemy.orm import Session
 
-from app.models.document import DocumentScan, ScanReviewStatus
+from app.models.document import DocumentScan, DocumentStatus, DocumentVersion, ScanReviewStatus
 from app.services import draft_workspace
 from app.services.document_finalize import run_full_scan, scan_passed
 from app.services.document_persistence import CreatedDocumentFromFile, create_document_from_file
@@ -88,6 +91,18 @@ def upload_and_scan(
         scan_skipped = False
 
     passed = scan_passed(scan_outcome)
+
+    # The row was just created with the model's default status
+    # (pending_review — v1 always starts there, awaiting the human's first
+    # look via the review chat, regardless of structural score). Injection
+    # is a SECURITY concern, not a quality one, so it overrides that default
+    # immediately, at upload time — don't block persistence, but don't let a
+    # flagged upload sit in the ordinary "awaiting review" bucket either.
+    if scan_outcome["injection"]["flagged"]:
+        db.query(DocumentVersion).filter(
+            DocumentVersion.version_id == created.version_id
+        ).update({"status": DocumentStatus.needs_attention}, synchronize_session=False)
+
     if scan_outcome["scan"] is not None:
         db.add(DocumentScan(
             version_id=created.version_id,
@@ -102,7 +117,11 @@ def upload_and_scan(
             injection_flagged=scan_outcome["injection"]["flagged"],
             injection_findings=scan_outcome["injection"]["findings"],
         ))
-        db.commit()
+
+    # Unconditional (not nested under the DocumentScan branch above): the
+    # needs_attention status update must be committed even on a total
+    # scoring failure (scan_outcome["scan"] is None) if injection was flagged.
+    db.commit()
 
     # Seed the review session's working file — same draft_workspace machinery
     # Phase 4 uses, just seeded with this upload's content instead of blank.

@@ -77,6 +77,7 @@ class ReviewMessageResponse(BaseModel):
     reformed_content: str | None = None
     injection_flagged: bool | None = None
     injection_findings: list[dict] | None = None
+    should_index: bool | None = None
 
 
 # --- helpers -------------------------------------------------------------

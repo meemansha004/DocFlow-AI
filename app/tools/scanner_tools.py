@@ -31,9 +31,9 @@ def reform_document(document_markdown: str, scan_result: dict) -> str:
     return _reform_document(document_markdown, scan_result)
 
 @tool
-def check_injection(document_markdown: str) -> dict:
+def scan_for_injection(content: str) -> dict:
     """
-    Checks a document's Markdown content for prompt-injection-style patterns
+    Checks Markdown/text content for prompt-injection-style patterns
     (instruction-override phrasing, jailbreak/role-override attempts, fake
     system-prompt markers, prompt-extraction attempts) — a SAFETY check,
     separate from structural quality. Use this whenever asked to check a
@@ -42,6 +42,6 @@ def check_injection(document_markdown: str) -> dict:
     always call this tool.
 
     Args:
-        document_markdown: the document's content in Markdown format
+        content: the document's content in Markdown format
     """
-    return _scan_for_injection(document_markdown)
+    return _scan_for_injection(content)

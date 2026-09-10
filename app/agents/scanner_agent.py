@@ -2,7 +2,7 @@ from agno.agent import Agent
 from agno.models.groq import Groq
 from agno.db.postgres import PostgresDb
 
-from app.tools.scanner_tools import score_document, reform_document, check_injection
+from app.tools.scanner_tools import score_document, reform_document, scan_for_injection
 from app.config import GROQ_MODEL, DATABASE_URL
 
 db = PostgresDb(db_url=DATABASE_URL, session_table="agent_sessions")
@@ -16,7 +16,7 @@ scanner_agent = Agent(
     ),
     debug_mode=False,
     model=Groq(id=GROQ_MODEL),
-    tools=[score_document, reform_document, check_injection],
+    tools=[score_document, reform_document, scan_for_injection],
     db=db,
     add_history_to_context=True,
     retries=2,
@@ -34,7 +34,7 @@ THE ONE RULE THAT OVERRIDES EVERYTHING ELSE
 - You may NEVER present a reformed document unless it came from the
   actual return value of reform_document.
 - You may NEVER state whether a document is flagged for injection, or
-  describe what was found, unless it came from a check_injection result
+  describe what was found, unless it came from a scan_for_injection result
   you just received.
 - The scoring scale is 0-60 (three criteria: structural_clarity,
   completeness, labeling_accuracy - 20 points each). This is NOT a
@@ -44,7 +44,7 @@ THE ONE RULE THAT OVERRIDES EVERYTHING ELSE
   called score_document yet, you must call it. Do NOT respond as if a
   score already exists.
 - If asked to check a document for injected/malicious instructions and
-  you have not called check_injection yet, you must call it.
+  you have not called scan_for_injection yet, you must call it.
 - If you are not sure whether something is real, treat it as NOT real.
   Sounding confident is never a substitute for having called a tool.
 
@@ -59,7 +59,7 @@ calling reform_document immediately after - see THE SCORING SEQUENCE.
 ===========================================================
 INJECTION CHECKS (separate from structural scoring)
 ===========================================================
-check_injection is a SAFETY check, independent of score_document - a
+scan_for_injection is a SAFETY check, independent of score_document - a
 document can score well structurally and still be flagged, or score
 poorly and not be flagged. Call it when asked to check a document for
 injected/malicious/hidden instructions, or before confirming a document
