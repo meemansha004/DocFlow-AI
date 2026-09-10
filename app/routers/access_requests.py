@@ -33,17 +33,19 @@ from app.models.team import (
     AccessRequest,
     AccessRequestStatus,
     Team,
-    TeamRole,
-    UserTeamMembership,
 )
 from app.models.user import User
 from app.services.access_control import has_permission
+from app.services.access_requests_service import (
+    AccessRequestError,
+    GRANT_TTL_DAYS as _GRANT_TTL_DAYS,
+    is_expired as _is_expired,
+    request_confidential_access,
+)
 from app.services.audit import record_audit
 from app.services.auth import ResolvedIdentity
 
 router = APIRouter(prefix="/access-requests", tags=["access-requests"])
-
-_GRANT_TTL_DAYS = 90
 
 
 class CreateAccessRequest(BaseModel):
@@ -63,10 +65,6 @@ class AccessRequestOut(BaseModel):
     decided_at: str | None
     expires_at: str | None
     active: bool  # approved and not expired — i.e. currently grants clearance
-
-
-def _is_expired(r: AccessRequest) -> bool:
-    return bool(r.expires_at and r.expires_at < datetime.now(timezone.utc))
 
 
 def _serialize(db: Session, r: AccessRequest, *, team=None, project=None, requester=None) -> AccessRequestOut:
@@ -89,70 +87,23 @@ def _serialize(db: Session, r: AccessRequest, *, team=None, project=None, reques
     )
 
 
-def _live_request(db: Session, user_id: uuid.UUID, team_id: uuid.UUID) -> AccessRequest | None:
-    """The caller's current pending — or approved-and-still-valid — request for a team."""
-    rows = db.execute(
-        select(AccessRequest)
-        .where(AccessRequest.user_id == user_id, AccessRequest.team_id == team_id)
-        .order_by(AccessRequest.requested_at.desc())
-    ).scalars().all()
-    for r in rows:
-        if r.status == AccessRequestStatus.pending:
-            return r
-        if r.status == AccessRequestStatus.approved and not _is_expired(r):
-            return r
-    return None
-
-
 @router.post("", response_model=AccessRequestOut, status_code=201)
 def create_access_request(
     body: CreateAccessRequest,
     identity: ResolvedIdentity = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    team = db.get(Team, body.team_id)
-    project = db.get(Project, team.project_id) if team else None
-    if team is None or project is None or project.tenant_id != identity.tenant_id:
-        raise HTTPException(status_code=404, detail="Team not found")
-
-    membership = db.execute(
-        select(UserTeamMembership).where(
-            UserTeamMembership.user_id == identity.user_id,
-            UserTeamMembership.team_id == team.team_id,
+    try:
+        req = request_confidential_access(
+            db,
+            user_id=identity.user_id,
+            team_id=body.team_id,
+            expected_tenant_id=identity.tenant_id,
         )
-    ).scalar_one_or_none()
-    is_project_admin = team.project_id in identity.project_admin_project_ids
-    if membership is None and not is_project_admin and not identity.is_org_admin:
-        raise HTTPException(status_code=403, detail="You are not a member of this team")
+    except AccessRequestError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
 
-    # team_lead / project_admin / org_admin already see confidential automatically.
-    if identity.is_org_admin or is_project_admin or (
-        membership is not None and membership.role == TeamRole.team_lead
-    ):
-        raise HTTPException(
-            status_code=409, detail="You already have confidential access on this team."
-        )
-
-    existing = _live_request(db, identity.user_id, team.team_id)
-    if existing is not None:
-        raise HTTPException(
-            status_code=409,
-            detail=f"You already have a {existing.status.value} confidential-access request for this team.",
-        )
-
-    req = AccessRequest(
-        user_id=identity.user_id, team_id=team.team_id, status=AccessRequestStatus.pending
-    )
-    db.add(req)
-    db.flush()
-    record_audit(
-        db, actor_id=identity.user_id, action="REQUEST_CONFIDENTIAL_ACCESS",
-        resource_type="team", resource_id=team.team_id,
-        details={"team": team.name, "project": project.name},
-    )
-    db.commit()
-    db.refresh(req)
-    return _serialize(db, req, team=team, project=project, requester=db.get(User, identity.user_id))
+    return _serialize(db, req, requester=db.get(User, identity.user_id))
 
 
 @router.get("/mine", response_model=list[AccessRequestOut])

@@ -23,6 +23,7 @@ from app.services.session_startup import select_current_user
 from app.services.session_context import set_current_session
 from app.services import draft_workspace
 from app.services.draft_chat import run_draft_turn
+from app.services.rag_chat import run_rag_turn
 
 from app.agents.scanner_agent import scanner_agent
 
@@ -70,6 +71,7 @@ def main():
     print("=" * 60)
 
     session_id = str(uuid.uuid4())
+    rag_session_id = None  # canonical ChatSession id, assigned on the first /rag turn
     active_agent = None
 
     while True:
@@ -120,10 +122,25 @@ def main():
                 print(response.content)
 
             elif active_agent == "/rag":
-                print(rag_stub(message))
+                if not message:
+                    print("Ask a question after /rag, e.g. /rag how many vacation days do we get?")
+                    continue
+                turn = run_rag_turn(
+                    user_id=user.user_id,
+                    project_id=project.project_id,
+                    session_id=rag_session_id,
+                    message=message,
+                )
+                rag_session_id = turn["session_id"]  # keep the conversation going
+                print(turn["reply"])
+                if turn["tools_called"]:
+                    print(f"\n(tools: {', '.join(turn['tools_called'])})")
 
             elif active_agent == "/query":
-                print(query_stub(message))
+                print(
+                    "The general Query Agent isn't wired up yet — use /rag for "
+                    "document questions and summaries."
+                )
 
         except Exception as e:
             print(f"[Error] Something went wrong: {e}")

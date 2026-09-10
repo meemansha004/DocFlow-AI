@@ -13,16 +13,23 @@ never asks about a stage/team/project. Real persistence is POST
 because there is no project resource involved.
 """
 
+import uuid
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
+from sqlalchemy.orm import Session
 
 from app.api.dependencies import get_current_user
+from app.database import get_db
+from app.models.project import Project
+from app.services.access_control import has_any_project_access
 from app.services.auth import ResolvedIdentity
+from app.services.chat_history import SessionScopeError
 from app.services.draft_chat import run_draft_turn
 from app.services.draft_export import DRAFTS_DIR
+from app.services.rag_chat import run_rag_turn
 
 router = APIRouter(prefix="/agents", tags=["agents"])
 
@@ -73,6 +80,57 @@ def draft_message(
         download_url=(
             f"/agents/draft/download/{turn['filename']}" if turn["filename"] else None
         ),
+    )
+
+
+class RagMessageRequest(BaseModel):
+    # Omit on the first turn; pass the session_id from the previous response
+    # to continue the same conversation.
+    session_id: str | None = Field(default=None, max_length=200)
+    project_id: uuid.UUID
+    message: str = Field(min_length=1, max_length=20000)
+
+
+class RagMessageResponse(BaseModel):
+    reply: str
+    tools_called: list[str] = []
+    session_id: str  # canonical id — echo it back on the next turn
+
+
+@router.post("/rag/message", response_model=RagMessageResponse)
+def rag_message(
+    body: RagMessageRequest,
+    identity: ResolvedIdentity = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if body.session_id is not None and Path(body.session_id).name != body.session_id:
+        raise HTTPException(status_code=422, detail="Invalid session_id")
+
+    project = db.get(Project, body.project_id)
+    if project is None or project.tenant_id != identity.tenant_id:
+        raise HTTPException(status_code=404, detail="Project not found")
+    if not has_any_project_access(db, identity.user_id, body.project_id):
+        raise HTTPException(status_code=403, detail="You don't have access to this project")
+
+    try:
+        turn = run_rag_turn(
+            user_id=identity.user_id,
+            project_id=body.project_id,
+            session_id=body.session_id,
+            message=body.message,
+        )
+    except SessionScopeError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001 — Groq / rate-limit / retrieval failures
+        raise HTTPException(
+            status_code=502,
+            detail=f"The RAG agent could not complete this turn: {exc}",
+        ) from exc
+
+    return RagMessageResponse(
+        reply=turn["reply"],
+        tools_called=turn["tools_called"],
+        session_id=turn["session_id"],
     )
 
 
