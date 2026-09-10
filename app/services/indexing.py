@@ -85,10 +85,9 @@ def _delete_existing_points(client, collection: str, document_id: uuid.UUID) -> 
     """
     Remove every existing point for this document_id, unconditionally — runs
     even on first index (a harmless no-op then), so a re-indexed document is
-    never simultaneously searchable under two versions. document_id isn't a
-    payload-indexed field (see collection_setup.py — only tenant_id/
-    project_id/stage_id are), so this is a filtered scan, not an indexed
-    lookup; fine at our data volumes.
+    never simultaneously searchable under two versions. document_id is payload-
+    indexed (see collection_setup.py) to support efficient document-level
+    filtering/deletion operations and satisfy Qdrant payload-index requirements.
     """
     client.delete(
         collection_name=collection,
@@ -119,7 +118,17 @@ def index_document(db: Session, document_id: uuid.UUID) -> dict:
         DocumentNotIndexableError: no current version, or its content isn't
             valid UTF-8 text (shouldn't happen for an `indexed` version).
     """
-    document = db.get(Document, document_id)
+    # Document indexing serialization:
+    # Acquire a row lock on the Document row so concurrent indexing attempts
+    # on the same document are serialized within the database transaction.
+    # This prevents concurrent delete-then-upsert operations from interleaving
+    # and creating mixed-version points in Qdrant.
+    document = (
+        db.query(Document)
+        .filter(Document.document_id == document_id)
+        .with_for_update()
+        .one_or_none()
+    )
     if document is None or document.current_version_id is None:
         raise DocumentNotIndexableError(f"Document {document_id} has no current version")
 
@@ -169,6 +178,8 @@ def index_document(db: Session, document_id: uuid.UUID) -> dict:
                 },
                 payload={
                     "document_id": str(document_id),
+                    "version_id": str(version.version_id),
+                    "version_number": version.version_number,
                     "project_id": str(document.project_id),
                     "tenant_id": str(document.tenant_id),
                     "stage_id": str(document.stage_id),
@@ -180,6 +191,7 @@ def index_document(db: Session, document_id: uuid.UUID) -> dict:
         ]
         client.upsert(collection_name=collection, points=points)
 
+    db.commit()
     logger.info(
         "index_document(%s): indexed %d chunk(s) into %s", document_id, len(chunks), collection
     )
