@@ -6,7 +6,10 @@ from app.tools.query_tools import (
     check_my_access,
     get_document_info,
     get_project_structure,
+    get_stage_document_status,
+    get_stage_requirements,
     get_version_history,
+    list_accessible_documents,
     list_pending_approvals,
     who_can_approve,
 )
@@ -27,7 +30,11 @@ query_agent = Agent(
         "return values — it never guesses and never takes any action."
     ),
     debug_mode=False,
-    model=Groq(id=GROQ_MODEL, request_params={"reasoning_effort": "low"}),
+    model=Groq(
+        id=GROQ_MODEL,
+        max_tokens=800,
+        request_params={"reasoning_effort": "none" if "qwen" in GROQ_MODEL.lower() else "low"},
+    ),
     tools=[
         get_document_info,
         get_version_history,
@@ -35,6 +42,9 @@ query_agent = Agent(
         list_pending_approvals,
         check_my_access,
         get_project_structure,
+        get_stage_requirements,
+        get_stage_document_status,
+        list_accessible_documents,
     ],
     db=db,
     add_history_to_context=True,
@@ -57,12 +67,14 @@ ask for it, never pass it to a tool.
   about whether a hidden document exists.
 - Pick the one tool that fits the question:
     · who uploaded / status / sensitivity / team / stage / upload date of a
-      named document -> get_document_info
-    · how many versions / version dates / which is current -> get_version_history
+      named document -> get_document_info (pass stage_reference if a stage is mentioned)
+    · how many versions / version dates / which is current -> get_version_history (pass stage_reference if a stage is mentioned)
     · who can approve / sign off for a team or stage -> who_can_approve
     · what's waiting for MY approval / review -> list_pending_approvals
     · am I allowed to see or upload to a team/stage -> check_my_access
     · what stages/teams exist, which stages need approval -> get_project_structure
+    · what documents are required / mandatory checklist for a stage -> get_stage_requirements
+    · which required docs are missing / checklist completion / coverage percentage -> get_stage_document_status
 - Genuinely ambiguous question, or a tool returned "ambiguous" -> ask one
   short clarifying question. Small talk -> a brief reply, no tool.
 - Call at most ONE tool per user message.

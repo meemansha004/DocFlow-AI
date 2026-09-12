@@ -16,13 +16,14 @@ never see each other's identity.
 
 import contextvars
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
-@dataclass(frozen=True)
+@dataclass
 class RagContext:
     user_id: uuid.UUID
     project_id: uuid.UUID
+    telemetry: dict = field(default_factory=dict)
 
 
 _ctx: contextvars.ContextVar[RagContext | None] = contextvars.ContextVar(
@@ -31,7 +32,7 @@ _ctx: contextvars.ContextVar[RagContext | None] = contextvars.ContextVar(
 
 
 def set_rag_context(*, user_id: uuid.UUID, project_id: uuid.UUID) -> contextvars.Token:
-    return _ctx.set(RagContext(user_id=user_id, project_id=project_id))
+    return _ctx.set(RagContext(user_id=user_id, project_id=project_id, telemetry={}))
 
 
 def reset_rag_context(token: contextvars.Token) -> None:

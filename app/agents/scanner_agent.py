@@ -17,8 +17,11 @@ scanner_agent = Agent(
     debug_mode=False,
     # Low reasoning for the agent's own calls (tool routing + relaying a tool
     # result). The heavy lifting — the actual rubric judgement — happens inside
-    # score_document's own Groq call, which keeps full reasoning.
-    model=Groq(id=GROQ_MODEL, request_params={"reasoning_effort": "low"}),
+    model=Groq(
+        id=GROQ_MODEL,
+        max_tokens=800,
+        request_params={"reasoning_effort": "none" if "qwen" in GROQ_MODEL.lower() else "low"},
+    ),
     tools=[score_document, reform_document, scan_for_injection],
     db=db,
     add_history_to_context=True,

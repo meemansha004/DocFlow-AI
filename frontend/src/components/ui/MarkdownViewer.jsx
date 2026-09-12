@@ -1,6 +1,6 @@
 import React, { useEffect } from 'react';
 import { X, Download, FileText } from 'lucide-react';
-import { renderMarkdown } from '../../lib/markdown';
+import MarkdownMessage from './MarkdownMessage';
 
 // In-app document viewer — renders Markdown content as formatted HTML in a
 // centered modal. Wider than the shared <Modal>; carries an optional Download
@@ -53,11 +53,7 @@ const MarkdownViewer = ({ open, onClose, title, subtitle, content = '', onDownlo
         </div>
 
         <div className="overflow-y-auto p-6">
-          <div
-            className="markdown-body"
-            // Content is Markdown; renderMarkdown escapes HTML before formatting.
-            dangerouslySetInnerHTML={{ __html: renderMarkdown(content) }}
-          />
+          <MarkdownMessage content={content} />
         </div>
       </div>
     </div>

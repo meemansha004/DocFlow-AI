@@ -3,6 +3,7 @@ from agno.models.groq import Groq
 from agno.db.postgres import PostgresDb
 
 from app.tools.rag_tools import (
+    list_accessible_documents,
     request_confidential_access,
     search_documents,
     summarize_document,
@@ -23,9 +24,12 @@ rag_agent = Agent(
     # reasoning_effort="low": gpt-oss models reason before every reply and
     # those hidden tokens count against the daily Groq budget. Tool-routing
     # and relaying a tool result need very little chain-of-thought. Applies to
-    # both model calls this agent makes per turn (tool pick + any relay).
-    model=Groq(id=GROQ_MODEL, request_params={"reasoning_effort": "low"}),
-    tools=[search_documents, summarize_document, request_confidential_access],
+    model=Groq(
+        id=GROQ_MODEL,
+        max_tokens=800,
+        request_params={"reasoning_effort": "none" if "qwen" in GROQ_MODEL.lower() else "low"},
+    ),
+    tools=[search_documents, summarize_document, request_confidential_access, list_accessible_documents],
     db=db,
     # Follow-up replies ("yes", "the second one", "what about testing?") only
     # need the last couple of turns — and every agent call re-sends this whole
@@ -78,7 +82,7 @@ CHOOSING THE TOOL
   Its return string is the FINAL, user-ready answer (already grounded and
   cited, or an honest "not found", or an access-request offer). It is shown to
   the user as-is — you don't see it or rewrite it.
-- "Summarise / overview of / tl;dr <a named document>" -> summarize_document.
+- "Summarise / overview of / tl;dr <a named document>" -> summarize_document. If the user mentions a stage (e.g. "in Sign Off"), pass stage_reference as well.
 - "yes" / "please do" right after you offered to request access ->
   request_confidential_access with the team from the previous offer.
 - Genuinely ambiguous -> ask one short clarifying question.
@@ -92,7 +96,7 @@ summarize_document:
 - "summarized": present the "summary" (it covers the whole document).
 - "not_found": say no document by that name was found; don't speculate about
   a hidden/confidential one.
-- "ambiguous": list "matches", ask which one.
+- "ambiguous": list "matches" (which indicate the stage of each copy), and ask the user which stage they mean. When the user specifies the stage, call summarize_document with stage_reference.
 - "blocked_by_sensitivity": say it's confidential above their clearance and
   OFFER to request access from the named team's lead — wait for a yes.
 - "unavailable" / "error": relay the message plainly.

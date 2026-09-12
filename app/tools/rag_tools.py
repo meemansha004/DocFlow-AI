@@ -17,6 +17,7 @@ verbatim in spirit — it must not invent an answer, a summary, a citation, or
 a confirmation that a tool did not return.
 """
 
+import time
 import uuid
 
 from app.database import SessionLocal
@@ -166,6 +167,7 @@ def _run_search(query: str, stage_id: str | None = None) -> dict:
                     "message": f"No stage matching '{stage_id}' exists in this project.",
                 }
 
+        t_tool0 = time.perf_counter()
         try:
             result = retrieve(db, ctx.user_id, ctx.project_id, query, resolved_stage)
         except NoProjectAccessError:
@@ -173,6 +175,14 @@ def _run_search(query: str, stage_id: str | None = None) -> dict:
                 "status": "no_project_access",
                 "message": "You don't have access to this project.",
             }
+
+        ctx.telemetry.update({
+            "auth_context_ms": result.timing.get("auth_ms", 0.0),
+            "qdrant_hybrid_ms": result.timing.get("qdrant_ms", 0.0),
+            "batch_abac_ms": result.timing.get("abac_ms", 0.0),
+            "flashrank_rerank_ms": result.timing.get("rerank_ms", 0.0),
+            "retrieval_total_ms": result.timing.get("retrieval_total_ms", 0.0),
+        })
 
         if result.chunks:
             stage_names = _stage_name_map(
@@ -199,10 +209,14 @@ def _run_search(query: str, stage_id: str | None = None) -> dict:
                     "section": ch.section_title,
                 })
 
+            t_gen0 = time.perf_counter()
             try:
                 answer = generate_answer(query, sources)
             except GenerationError as exc:
                 return {"status": "error", "message": f"Could not generate an answer: {exc}"}
+            t_gen = (time.perf_counter() - t_gen0) * 1000
+            ctx.telemetry["llm_generation_ms"] = t_gen
+            ctx.telemetry["tool_total_ms"] = (time.perf_counter() - t_tool0) * 1000
 
             payload = {
                 "status": "answered",
@@ -241,9 +255,9 @@ def _run_search(query: str, stage_id: str | None = None) -> dict:
 # ---------------------------------------------------------------------------
 
 @tool
-def summarize_document(document_reference: str) -> dict:
+def summarize_document(document_reference: str, stage_reference: str | None = None) -> dict:
     """
-    Summarise ONE whole document, named by title or filename. Use this — NOT
+    Summarise ONE whole document, named by title, filename, or document ID. Use this — NOT
     search_documents — whenever the user asks to "summarise", "give me an
     overview of", or "tl;dr" a SPECIFIC named document.
 
@@ -253,8 +267,11 @@ def summarize_document(document_reference: str) -> dict:
     summarised — never fragments.
 
     Args:
-        document_reference: the document's title or filename, as the user
+        document_reference: the document's title, filename, or UUID, as the user
             said it (e.g. "the onboarding guide", "vacation-policy.md").
+        stage_reference: optional stage name or stage UUID (e.g. "Sign Off",
+            "Architecture & Design") to disambiguate when multiple stages contain
+            a document with the same name, or when the user specifies a stage.
 
     Returns a dict with "status":
         - "summarized": {"document", "summary"}
@@ -262,7 +279,7 @@ def summarize_document(document_reference: str) -> dict:
           (this also covers documents the user cannot see at all — do not
           speculate about whether such a document exists).
         - "ambiguous": {"matches": [...]} — several documents match; ask the
-          user which one.
+          user which one (specifying the stage).
         - "blocked_by_sensitivity": the document exists and is on the user's
           team but is confidential above their clearance. Carries
           "requestable_teams" — offer to request access.
@@ -276,17 +293,25 @@ def summarize_document(document_reference: str) -> dict:
         if not ref:
             return {"status": "not_found", "message": "No document reference was given."}
 
-        candidates = _match_documents(db, ctx.project_id, ref)
+        stage_id = None
+        if stage_reference:
+            stage_id = _resolve_stage(db, ctx.project_id, stage_reference)
+
+        candidates = _match_documents(db, ctx.project_id, ref, stage_id=stage_id)
         if not candidates:
             return {
                 "status": "not_found",
                 "message": f"No document matching '{ref}' was found in this project.",
             }
         if len(candidates) > 1:
+            stage_names = _stage_name_map(db, ctx.project_id, {d.stage_id for d in candidates})
             return {
                 "status": "ambiguous",
-                "matches": [d.original_filename for d in candidates],
-                "message": "Multiple documents match that reference.",
+                "matches": [
+                    f"{d.original_filename} (stage: '{stage_names.get(d.stage_id, 'Unknown')}')"
+                    for d in candidates
+                ],
+                "message": "Multiple documents match that reference across different stages. Please specify which stage.",
             }
 
         doc = candidates[0]
@@ -402,3 +427,60 @@ def request_confidential_access(team_id: str) -> dict:
         }
     finally:
         db.close()
+
+
+# ---------------------------------------------------------------------------
+# 4. list_accessible_documents
+# ---------------------------------------------------------------------------
+
+@tool
+def list_accessible_documents(stage_reference: str | None = None) -> dict:
+    """Lists all documents in this project that the user is authorized to view
+    under their current team membership, clearance level, and stage access.
+    Optionally filters by `stage_reference` (stage name or UUID). Call this whenever
+    the user asks 'what documents do I have access to', 'which documents can I see',
+    or asks for a list of project documents.
+    """
+    ctx = get_rag_context()
+    db = SessionLocal()
+    try:
+        from app.services.authorization_context import build_authorization_context
+        from app.services.access_control import classify_documents_visibility, DocumentVisibility
+        auth_ctx = build_authorization_context(db, ctx.user_id, ctx.project_id)
+        query = db.query(Document).filter(
+            Document.project_id == ctx.project_id,
+            Document.tenant_id == auth_ctx.tenant_id,
+        )
+
+        stage_name = None
+        if stage_reference:
+            stage_id = _resolve_stage(db, ctx.project_id, stage_reference)
+            if stage_id is not None:
+                query = query.filter(Document.stage_id == stage_id)
+                stg = db.get(Stage, stage_id)
+                stage_name = stg.name if stg else str(stage_id)
+
+        all_docs = query.order_by(Document.created_at.desc()).all()
+        doc_ids = [d.document_id for d in all_docs]
+        vis_map = classify_documents_visibility(db, auth_ctx, doc_ids)
+
+        visible = [d for d in all_docs if vis_map.get(d.document_id) == DocumentVisibility.fully_allowed]
+        stage_names = _stage_name_map(db, ctx.project_id, {d.stage_id for d in visible})
+
+        return {
+            "status": "ok",
+            "scope": f"stage '{stage_name}'" if stage_name else "entire project",
+            "count": len(visible),
+            "documents": [
+                {
+                    "name": d.original_filename,
+                    "stage": stage_names.get(d.stage_id, "Unknown"),
+                    "sensitivity": d.sensitivity_level.name,
+                    "uploaded_at": d.created_at.isoformat() if d.created_at else None,
+                }
+                for d in visible
+            ],
+        }
+    finally:
+        db.close()
+

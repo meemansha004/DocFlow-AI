@@ -18,8 +18,11 @@ drafting_agent = Agent(
     debug_mode=False,
     # Low reasoning for the agent's own calls (tool routing + short replies).
     # The document generation itself is draft_document's own Groq call, which
-    # keeps full reasoning.
-    model=Groq(id=GROQ_MODEL, request_params={"reasoning_effort": "low"}),
+    model=Groq(
+        id=GROQ_MODEL,
+        max_tokens=800,
+        request_params={"reasoning_effort": "none" if "qwen" in GROQ_MODEL.lower() else "low"},
+    ),
     tools=[draft_document, confirm_draft],
     db=db,
     # No conversation history: every turn is self-contained. The current draft
