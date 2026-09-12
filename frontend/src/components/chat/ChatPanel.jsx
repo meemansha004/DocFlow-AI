@@ -6,6 +6,7 @@ import DraftDocumentCard from './DraftDocumentCard';
 import DocFileCard from '../ui/DocFileCard';
 import MarkdownViewer from '../ui/MarkdownViewer';
 import MarkdownMessage from '../ui/MarkdownMessage';
+import UploadToProjectModal from './UploadToProjectModal';
 import { agentsApi, chatApi, ragApi, queryApi, documentReviewApi } from '../../lib/api';
 import { draftTitle } from '../../lib/markdown';
 import { saveBlob } from '../../lib/download';
@@ -85,7 +86,34 @@ const ChatPanel = ({ projectId, mode = 'rag', reviewSession = null, onReviewFina
   const [isTyping, setIsTyping] = useState(false);
   // Finalized draft opened in the in-app viewer (Part 1).
   const [viewerDoc, setViewerDoc] = useState(null);
+  const [uploadModalData, setUploadModalData] = useState({
+    open: false,
+    draftId: '',
+    defaultTitle: '',
+    messageId: null,
+  });
+  const [notice, setNotice] = useState('');
   const messagesEndRef = useRef(null);
+
+  const handleUploadSuccess = (res) => {
+    setNotice(`"${res.original_filename || 'Draft'}" was uploaded to ${res.stageName}.`);
+    if (uploadModalData.messageId) {
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === uploadModalData.messageId
+            ? {
+                ...m,
+                uploadedInfo: {
+                  stageName: res.stageName,
+                  projectName: res.projectName,
+                  documentId: res.document_id,
+                },
+              }
+            : m,
+        ),
+      );
+    }
+  };
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -448,6 +476,19 @@ const ChatPanel = ({ projectId, mode = 'rag', reviewSession = null, onReviewFina
           ))}
         </div>
       </aside>
+      {notice && (
+        <div className="relative z-40 bg-emerald-500/10 border-b border-emerald-500/20 px-4 py-2 text-xs text-emerald-300 flex items-center justify-between shrink-0">
+          <span>{notice}</span>
+          <button
+            type="button"
+            onClick={() => setNotice('')}
+            className="text-emerald-400 hover:text-emerald-200 p-0.5 rounded"
+            aria-label="Dismiss notice"
+          >
+            <X size={14} />
+          </button>
+        </div>
+      )}
       <div className="relative z-40 shrink-0 p-4 border-b border-border/50 bg-surface">
         <div className="flex items-center justify-between">
           <h2 className="text-lg font-semibold text-gray-100 flex items-center gap-2">
@@ -584,24 +625,29 @@ const ChatPanel = ({ projectId, mode = 'rag', reviewSession = null, onReviewFina
                         </p>
                       )}
                       {msg.finalContent && (
-                        <DocFileCard
-                          title={draftTitle({ content: msg.finalContent, filename: msg.downloadName })}
-                          meta="Document · MD"
-                          onOpen={() => setViewerDoc({
-                            title: draftTitle({ content: msg.finalContent, filename: msg.downloadName }),
-                            subtitle: msg.downloadName,
-                            content: msg.finalContent,
-                            downloadUrl: msg.downloadUrl,
-                            downloadName: msg.downloadName,
-                          })}
+                        <DraftDocumentCard
+                          content={msg.finalContent}
+                          filename={msg.downloadName}
+                          finalized={true}
                           onDownload={msg.downloadUrl
                             ? () => handleDownload(msg.downloadUrl, msg.downloadName)
                             : undefined}
+                          onUploadToProject={msg.draftId
+                            ? () => setUploadModalData({
+                                open: true,
+                                draftId: msg.draftId,
+                                defaultTitle: draftTitle({ content: msg.finalContent, filename: msg.downloadName }),
+                                messageId: msg.id,
+                              })
+                            : undefined}
+                          uploadedInfo={msg.uploadedInfo || null}
                         />
                       )}
-                      <p className="text-[11px] text-gray-600">
-                        Local file only — not uploaded to any project, stage, or team.
-                      </p>
+                      {!msg.uploadedInfo && (
+                        <p className="text-[11px] text-gray-500">
+                          Local draft file — click &ldquo;Upload to Project&rdquo; to save directly into a project stage.
+                        </p>
+                      )}
                     </div>
                   )}
                   {(msg.reviewScan || msg.reviewFinalized) && (
@@ -695,6 +741,14 @@ const ChatPanel = ({ projectId, mode = 'rag', reviewSession = null, onReviewFina
           : undefined}
       />
 
+      <UploadToProjectModal
+        open={uploadModalData.open}
+        onClose={() => setUploadModalData((prev) => ({ ...prev, open: false }))}
+        draftId={uploadModalData.draftId}
+        defaultTitle={uploadModalData.defaultTitle}
+        initialProjectId={projectId}
+        onSuccess={handleUploadSuccess}
+      />
     </div>
   );
 };
