@@ -69,8 +69,9 @@ const ChatPanel = ({ projectId, mode = 'rag', reviewSession = null, onReviewFina
   const isDraft = mode === 'draft';
   const isReview = mode === 'review';
   const isScan = mode === 'scan';
-  const isSearch = mode === 'rag';
+  const isSearch = mode === 'rag' || mode === 'search';
   const isQuery = mode === 'query';
+  const hasHistory = isSearch || isQuery || isDraft;
 
   const [messages, setMessages] = useState([]);
   const [sessions, setSessions] = useState([]);
@@ -95,21 +96,6 @@ const ChatPanel = ({ projectId, mode = 'rag', reviewSession = null, onReviewFina
   }, [messages, isTyping]);
 
   useEffect(() => {
-    if (isQuery) {
-      // Read-only metadata Q&A. Persisted server-side per (user, project) like
-      // Search, but no history sidebar — a fresh conversation each visit.
-      setMessages([]);
-      setSessionId(null);
-      setHistoryLoading(false);
-      return undefined;
-    }
-    if (isDraft) {
-      // Fresh drafting conversation for this project visit.
-      setDraftSessionId(newSessionId());
-      setMessages([]);
-      setHistoryLoading(false);
-      return undefined;
-    }
     if (isScan) {
       // Fresh standalone-scan conversation — not persisted, not reload-safe.
       setScanSessionId(newSessionId());
@@ -124,24 +110,39 @@ const ChatPanel = ({ projectId, mode = 'rag', reviewSession = null, onReviewFina
       setHistoryLoading(false);
       return undefined;
     }
-    // Search (RAG): reload the most recent conversation for this user+project
-    // so a page refresh mid-conversation doesn't lose the thread.
+    if (!hasHistory || !projectId) {
+      setMessages([]);
+      setSessionId(null);
+      setHistoryLoading(false);
+      return undefined;
+    }
+
+    // Search (RAG), Query, and Draft: reload conversations for this user+project+mode
+    // so past conversations can be viewed and resumed.
     let cancelled = false;
     setHistoryLoading(true);
     setMessages([]);
     setSessionId(null);
-    chatApi.sessions(projectId, 'search')
+
+    const historyMode = isSearch ? 'search' : (isQuery ? 'query' : 'draft');
+
+    chatApi.sessions(projectId, historyMode)
       .then((items) => {
         if (cancelled) return [];
         setSessions(items);
         if (items[0]) {
-          setSessionId(items[0].session_id);
-          return chatApi.messages(items[0].session_id);
+          const firstId = items[0].session_id;
+          setSessionId(firstId);
+          if (isDraft) setDraftSessionId(firstId);
+          return chatApi.messages(firstId);
+        }
+        if (isDraft) {
+          setDraftSessionId(newSessionId());
         }
         return [];
       })
       .then((items) => {
-        if (!cancelled && items) setMessages(items.map((item) => ({
+        if (!cancelled && items && items.length > 0) setMessages(items.map((item) => ({
           id: item.message_id,
           text: item.content,
           sender: item.role === 'user' ? 'user' : 'bot',
@@ -160,6 +161,7 @@ const ChatPanel = ({ projectId, mode = 'rag', reviewSession = null, onReviewFina
 
   const selectSession = async (id) => {
     setSessionId(id);
+    if (isDraft) setDraftSessionId(id);
     setIsTyping(true);
     try {
       const items = await chatApi.messages(id);
@@ -178,6 +180,7 @@ const ChatPanel = ({ projectId, mode = 'rag', reviewSession = null, onReviewFina
 
   const startNewChat = () => {
     setSessionId(null);
+    if (isDraft) setDraftSessionId(newSessionId());
     setMessages([]);
     setHistoryOpen(false);
   };
@@ -186,8 +189,9 @@ const ChatPanel = ({ projectId, mode = 'rag', reviewSession = null, onReviewFina
     await chatApi.removeSession(id);
     const next = sessions.filter((session) => session.session_id !== id);
     setSessions(next);
-    if (id === sessionId) {
+    if (id === sessionId || (isDraft && id === draftSessionId)) {
       setSessionId(null);
+      if (isDraft) setDraftSessionId(newSessionId());
       setMessages([]);
     }
   };
@@ -197,10 +201,15 @@ const ChatPanel = ({ projectId, mode = 'rag', reviewSession = null, onReviewFina
     setMessages((prev) => [...prev, userMsg]);
     setIsTyping(true);
 
-    // --- Drafting flow: real backend, decoupled from persistence ---
+    // --- Drafting flow: real backend, project-persisted ---
     if (isDraft) {
       try {
-        const res = await agentsApi.draftMessage(draftSessionId, text);
+        const hadSession = Boolean(sessionId);
+        const res = await agentsApi.draftMessage(draftSessionId, text, projectId);
+        if (res.session_id) {
+          setSessionId(res.session_id);
+          setDraftSessionId(res.session_id);
+        }
         setMessages((prev) => [...prev, {
           id: `${Date.now()}-bot`,
           sender: 'bot',
@@ -208,12 +217,17 @@ const ChatPanel = ({ projectId, mode = 'rag', reviewSession = null, onReviewFina
           markdown: true,
           drafted: !!res.drafted,
           finalized: !!res.finalized,
+          draftContent: res.draft_content || res.final_content || null,
           scan: res.scan || null,
           scanError: res.scan_error || null,
           downloadUrl: res.download_url || null,
           downloadName: res.filename || null,
+          draftId: res.draft_id || null,
           finalContent: res.final_content || null,
         }]);
+        if (!hadSession && projectId) {
+          chatApi.sessions(projectId, 'draft').then(setSessions).catch(() => {});
+        }
       } catch (err) {
         setMessages((prev) => [...prev, {
           id: `${Date.now()}-err`, sender: 'bot', isError: true,
@@ -288,6 +302,7 @@ const ChatPanel = ({ projectId, mode = 'rag', reviewSession = null, onReviewFina
     // --- Query flow: read-only metadata agent, per-(user, project) session ---
     if (isQuery) {
       try {
+        const hadSession = Boolean(sessionId);
         const res = await queryApi.message(projectId, sessionId, text);
         if (res.session_id) setSessionId(res.session_id);
         setMessages((prev) => [...prev, {
@@ -297,6 +312,9 @@ const ChatPanel = ({ projectId, mode = 'rag', reviewSession = null, onReviewFina
           markdown: true,
           toolsCalled: res.tools_called || [],
         }]);
+        if (!hadSession && projectId) {
+          chatApi.sessions(projectId, 'query').then(setSessions).catch(() => {});
+        }
       } catch (err) {
         setMessages((prev) => [...prev, {
           id: `${Date.now()}-err`, sender: 'bot', isError: true,
@@ -397,7 +415,7 @@ const ChatPanel = ({ projectId, mode = 'rag', reviewSession = null, onReviewFina
 
   return (
     <div className="relative isolate flex flex-1 min-h-0 flex-col overflow-hidden bg-background">
-      {isSearch && historyOpen && (
+      {hasHistory && historyOpen && (
         <button
           type="button"
           aria-label="Close chat history"
@@ -405,7 +423,7 @@ const ChatPanel = ({ projectId, mode = 'rag', reviewSession = null, onReviewFina
           className="absolute inset-x-0 bottom-0 top-[84px] z-20 cursor-default bg-black/30"
         />
       )}
-      <aside hidden={!isSearch} className={`absolute right-0 top-[84px] bottom-0 z-30 flex w-72 max-w-[85%] flex-col border-l border-border bg-surface shadow-2xl transition-transform duration-200 ${historyOpen ? 'translate-x-0' : 'translate-x-full'}`}>
+      <aside hidden={!hasHistory} className={`absolute right-0 top-[84px] bottom-0 z-30 flex w-72 max-w-[85%] flex-col border-l border-border bg-surface shadow-2xl transition-transform duration-200 ${historyOpen ? 'translate-x-0' : 'translate-x-full'}`}>
         <div className="flex items-center justify-between border-b border-border/50 p-4">
           <h3 className="text-sm font-semibold text-gray-200">Chat history</h3>
           <button type="button" onClick={() => setHistoryOpen(false)} className="text-gray-400 hover:text-gray-100" aria-label="Close chat history">
@@ -419,7 +437,7 @@ const ChatPanel = ({ projectId, mode = 'rag', reviewSession = null, onReviewFina
           {historyLoading && <p className="px-2 py-3 text-xs text-gray-500">Loading history...</p>}
           {!historyLoading && sessions.length === 0 && <p className="px-2 py-3 text-xs text-gray-500">No previous chats</p>}
           {sessions.map((session) => (
-            <div key={session.session_id} className={`group flex items-center gap-1 rounded-lg ${session.session_id === sessionId ? 'bg-primary/15' : 'hover:bg-background'}`}>
+            <div key={session.session_id} className={`group flex items-center gap-1 rounded-lg ${session.session_id === (isDraft ? draftSessionId : sessionId) ? 'bg-primary/15' : 'hover:bg-background'}`}>
               <button type="button" onClick={() => selectSession(session.session_id)} className="min-w-0 flex-1 px-2 py-2 text-left text-xs text-gray-300">
                 <span className="flex items-center gap-1.5"><MessageSquare size={12} className="shrink-0" /><span className="truncate">{session.title}</span></span>
               </button>
@@ -444,7 +462,7 @@ const ChatPanel = ({ projectId, mode = 'rag', reviewSession = null, onReviewFina
             >
               <ArrowLeft size={13} /> Back to drafting
             </button>
-          ) : isSearch && (
+          ) : hasHistory && (
             <button
               type="button"
               onClick={() => setHistoryOpen((open) => !open)}
@@ -485,7 +503,7 @@ const ChatPanel = ({ projectId, mode = 'rag', reviewSession = null, onReviewFina
               const isDraftDoc =
                 !msg.isError &&
                 msg.sender === 'bot' &&
-                (msg.drafted || (isDraft && msg.text && msg.text.includes('# ')));
+                (msg.drafted || Boolean(msg.draftContent) || (isDraft && msg.text && msg.text.includes('# ')));
 
               return (
                 <div key={msg.id} className={`flex gap-3 ${msg.sender === 'user' ? 'flex-row-reverse' : ''}`}>
@@ -498,7 +516,11 @@ const ChatPanel = ({ projectId, mode = 'rag', reviewSession = null, onReviewFina
                     ) : msg.sender === 'user' ? (
                       <p className="whitespace-pre-wrap">{msg.text}</p>
                     ) : isDraftDoc ? (
-                      <DraftDocumentCard content={msg.text} filename={msg.downloadName} />
+                      <DraftDocumentCard
+                        content={msg.draftContent || msg.text}
+                        filename={msg.downloadName}
+                        comment={msg.draftContent ? msg.text : null}
+                      />
                     ) : (
                       <MarkdownMessage content={msg.text} />
                     )}
@@ -672,6 +694,7 @@ const ChatPanel = ({ projectId, mode = 'rag', reviewSession = null, onReviewFina
           ? () => handleDownload(viewerDoc.downloadUrl, viewerDoc.downloadName)
           : undefined}
       />
+
     </div>
   );
 };

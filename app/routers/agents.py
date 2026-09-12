@@ -1,5 +1,5 @@
 """
-HTTP surface for the Drafting, RAG, and Scanner agents — the CLI's chat loop
+HTTP surface for the Drafting, RAG, and Scanner agents â€” the CLI's chat loop
 exposed over HTTP.
 
   POST /agents/draft/message            one drafting turn { session_id, message }
@@ -8,9 +8,9 @@ exposed over HTTP.
   POST /agents/query/message            one Query turn { session_id?, project_id, message }
   POST /agents/scan/message             one standalone-scan turn { session_id, message }
 
-DECOUPLED FROM PERSISTENCE (MERGE_DECISIONS §4): /draft and /scan never create a
+DECOUPLED FROM PERSISTENCE (MERGE_DECISIONS Â§4): /draft and /scan never create a
 Document row, never touch has_permission(), and never ask about a stage/team/
-project — they only require authentication, and there is no ABAC because there
+project â€” they only require authentication, and there is no ABAC because there
 is no project resource involved. /rag IS project-scoped: it checks project
 access and enforces per-(user, project) conversation ownership.
 """
@@ -41,6 +41,7 @@ router = APIRouter(prefix="/agents", tags=["agents"])
 class DraftMessageRequest(BaseModel):
     session_id: str = Field(min_length=1, max_length=200)
     message: str = Field(default="", max_length=20000)
+    project_id: uuid.UUID | None = None
 
 
 class DraftMessageResponse(BaseModel):
@@ -50,8 +51,11 @@ class DraftMessageResponse(BaseModel):
     scan: dict | None = None
     scan_error: str | None = None
     final_content: str | None = None
+    draft_content: str | None = None
     download_url: str | None = None
     filename: str | None = None
+    draft_id: str | None = None
+    session_id: str | None = None
 
 
 @router.post("/draft/message", response_model=DraftMessageResponse)
@@ -66,7 +70,12 @@ def draft_message(
         raise HTTPException(status_code=422, detail="Invalid session_id")
 
     try:
-        turn = run_draft_turn(safe_id, body.message)
+        turn = run_draft_turn(
+            safe_id,
+            body.message,
+            user_id=identity.user_id,
+            project_id=body.project_id,
+        )
     except Exception as exc:  # noqa: BLE001 — Groq / rate-limit / parse failures
         raise HTTPException(
             status_code=502,
@@ -80,7 +89,10 @@ def draft_message(
         scan=turn["scan"],
         scan_error=turn["scan_error"],
         final_content=turn["final_content"],
+        draft_content=turn.get("draft_content"),
         filename=turn["filename"],
+        draft_id=turn.get("draft_id"),
+        session_id=turn.get("session_id", safe_id),
         download_url=(
             f"/agents/draft/download/{turn['filename']}" if turn["filename"] else None
         ),
@@ -258,3 +270,4 @@ def download_draft(
     if not path.is_file():
         raise HTTPException(status_code=404, detail="That drafted file was not found")
     return FileResponse(path, media_type="text/markdown", filename=safe)
+

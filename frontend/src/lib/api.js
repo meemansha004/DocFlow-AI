@@ -418,10 +418,10 @@ export const chatApi = {
 export const agentsApi = {
   // -> { reply, drafted, finalized, scan, scan_error, final_content,
   //      download_url, filename }
-  draftMessage: (sessionId, message) =>
+  draftMessage: (sessionId, message, projectId) =>
     request('/agents/draft/message', {
       method: 'POST',
-      body: { session_id: sessionId, message: message || '' },
+      body: { session_id: sessionId, message: message || '', project_id: projectId || null },
     }),
   // Standalone Structure Scanner chat (DEFERRED_ITEMS.md #4). Auth only, no
   // project/persistence. -> { reply, tools_called: [...] }
