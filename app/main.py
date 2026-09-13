@@ -12,6 +12,7 @@ from app.routers import (
     document_review,
     documents,
     projects,
+    project_intelligence,
     stages,
     teams,
     workflow,
@@ -41,6 +42,7 @@ app.include_router(document_review.router)
 app.include_router(workflow.router)
 app.include_router(workspace.router)
 app.include_router(projects.router)
+app.include_router(project_intelligence.router)
 app.include_router(stages.router)
 app.include_router(teams.router)
 app.include_router(admin.router)
