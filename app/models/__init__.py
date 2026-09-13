@@ -14,6 +14,16 @@ from app.models.document import (
 from app.models.workflow import WorkflowState
 from app.models.audit import AuditLog
 from app.models.chat import ChatSession, ChatMessage
+from app.models.graph import (
+    Node,
+    Edge,
+    Claim,
+    ExtractionRun,
+    AuditRun,
+    AuditFinding,
+    ProjectMetricSnapshot,
+    StageMetricSnapshot,
+)
 
 __all__ = [
     "Tenant",
@@ -35,4 +45,13 @@ __all__ = [
     "AuditLog",
     "ChatSession",
     "ChatMessage",
+    "Node",
+    "Edge",
+    "Claim",
+    "ExtractionRun",
+    "AuditRun",
+    "AuditFinding",
+    "ProjectMetricSnapshot",
+    "StageMetricSnapshot",
 ]
+
